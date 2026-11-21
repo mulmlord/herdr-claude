@@ -1,0 +1,48 @@
+#!/bin/bash
+# herdr-open: open a folder in the main herdr window, the Pasture.
+#
+# The folder gets a shell in its project's space (see herdr-project-space; created
+# when missing): the space's fresh first pane, a pane idling at a shell prompt in
+# that folder alone in its tab, or else a new tab there. herdr switches to it and the
+# Pasture window comes to the front, wherever it is.
+#
+# Usage: herdr-open [DIR]
+#   Prints the pane id. Exits 3 when no herdr window is attached (herdr has switched,
+#   but there is nothing to bring forward; the caller may start one), 2 when DIR has no
+#   project space ($HOME): then only the Pasture comes forward. 1 on errors.
+set -uo pipefail
+
+dir=$(realpath -e -- "${1:-$PWD}") || exit 1
+read -r ws new < <(herdr-project-space "$dir")
+if [[ -z ${ws:-} ]]; then
+  herdr-window --focus > /dev/null || exit 3
+  exit 2
+fi
+
+panes=$(herdr pane list | jq -c --arg w "$ws" '[.result.panes[] | select(.workspace_id == $w)]')
+pane="" tab=""
+if [[ -n ${new:-} ]]; then
+  pane=$(jq -r '.[0].pane_id // empty' <<< "$panes")
+else
+  # A shell at its prompt in DIR, alone in its tab
+  for p in $(jq -r 'group_by(.tab_id)[] | select(length == 1) | .[0].pane_id' <<< "$panes"); do
+    if herdr pane process-info --pane "$p" | jq -e --arg d "$dir" \
+      '.result.process_info | .foreground_process_group_id == .shell_pid and any(.foreground_processes[]; .cwd == $d)' > /dev/null; then
+      pane=$p
+      break
+    fi
+  done
+fi
+if [[ -n $pane ]]; then
+  tab=$(jq -r --arg p "$pane" 'first(.[] | select(.pane_id == $p) | .tab_id) // empty' <<< "$panes")
+else
+  created=$(herdr tab create --workspace "$ws" --cwd "$dir" --no-focus)
+  pane=$(jq -r '.result.root_pane.pane_id // empty' <<< "$created")
+  tab=$(jq -r '.result.tab.tab_id // empty' <<< "$created") # a pane this new isn't listed yet
+fi
+[[ -n $pane && -n $tab ]] || exit 1
+
+herdr workspace focus "$ws" > /dev/null
+herdr tab focus "$tab" > /dev/null
+echo "$pane"
+herdr-window --focus > /dev/null || exit 3

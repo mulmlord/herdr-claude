@@ -39,7 +39,8 @@ it; any other directory is a project of its own.
 |---|---|
 | `herdr-project-space` | Prints the space of a directory's project, creating it when missing; `--focus` switches herdr to it. `herdr-project-space [--focus] [DIR]` |
 | `herdr-window` | The main herdr window: herdr keeps one session that every client shows, so one window is enough, the client attached longest. Prints its address; `--focus` brings it forward. The launchers here use it instead of attaching another client. |
-| `herdr-here` | The main herdr window on the space of the focused terminal's project (for Omarchy's SUPER+CTRL+RETURN); a herdr terminal only opens when no herdr window exists |
+| `herdr-open` | Opens a folder in the main herdr window: a shell in its project's space (a fresh space's first pane, a shell idling in that folder alone in its tab, or a new tab), then herdr shows it and the window comes to the front, whichever Hyprland workspace it is on. |
+| `herdr-here` | `herdr-open` for the focused terminal's folder (for Omarchy's SUPER+CTRL+RETURN); a herdr terminal only opens when no herdr window exists |
 | `claude-herdr` | Opens Claude in its project's space: in the space's only pane when that idles at a shell prompt in the directory (a fresh space), else in a new tab; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [--no-focus] [--space SDIR] [DIR] [-- CLAUDE_ARGS...]`; `$HOME` becomes the projects root, and `--space` puts Claude into another project's space while it runs in DIR. |
 | `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes; `--space DIR` puts them into DIR's project space. `claude-herdr-move` alone lists them. |
 | `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: a starting subagent gets a new tab in the session's space, named after its task; a background shell gets a pane beside the work of the agent that started it (beside the main Claude pane for the session itself), further shells stacking below. Nothing takes the focus. Returns at once outside herdr (~10 ms per Bash call). |
@@ -61,7 +62,7 @@ it; any other directory is a project of its own.
 
 ```bash
 for f in claude-herdr claude-herdr-subagents claude-herdr-move claude-herdr-tabs claude-herdr-view \
-         herdr-project-space herdr-here herdr-window; do
+         herdr-project-space herdr-open herdr-here herdr-window; do
   ln -s "$PWD/$f" ~/.local/bin/
 done
 ln -s "$PWD/claude-herdr-subagents.service" ~/.config/systemd/user/
@@ -85,18 +86,27 @@ o.bind("SUPER + ALT + H", "Claude Code (herdr)", "claude-herdr")
 o.rebind("SUPER + CTRL + RETURN", "Herdr (project space)", "herdr-here")
 ```
 
-And so that a plain `herdr` typed in a project shows its space in the main herdr window, in `~/.bashrc`: inside herdr (where a nested herdr is refused) it switches the running herdr, outside it brings the main window forward, and only without any herdr window does it attach here:
+And so that a plain `herdr` belongs to the main herdr window, in `~/.bashrc`: inside herdr (where a nested herdr is refused) it switches to the folder's space; in a terminal outside, the folder gets a shell in the main window (`herdr-open`), that window comes to the front and the terminal closes, since its shell lives on there (it stays in tmux, over SSH or with jobs running). Only without any herdr window does herdr attach in that terminal:
 
 ```bash
 herdr() {
-  if (($# == 0)) && command -v herdr-project-space > /dev/null; then
-    local ws
-    ws=$(herdr-project-space --focus "$PWD")
+  if (($# == 0)) && command -v herdr-open > /dev/null; then
     if [[ -n ${HERDR_ENV:-} ]]; then
-      [[ -n $ws ]] || echo "herdr: no project space for $PWD" >&2
+      [[ -n $(herdr-project-space --focus "$PWD") ]] || echo "herdr: no project space for $PWD" >&2
       return
     fi
-    herdr-window --focus > /dev/null && return
+    herdr-open "$PWD" > /dev/null
+    case $? in
+      0)
+        if [[ -z $(jobs -p) ]] && hyprctl clients -j 2> /dev/null |
+          jq -e --argjson p "$PPID" 'any(.[]; .pid == $p)' > /dev/null; then
+          exit
+        fi
+        return
+        ;;
+      3) ;;  # no herdr window yet: start one here
+      *) return ;;
+    esac
   fi
   command herdr "$@"
 }
