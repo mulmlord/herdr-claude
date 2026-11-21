@@ -10,6 +10,13 @@ of each result as they land in its transcript. It counts as finished once the
 SubagentStop marker is newer than the transcript, or the session's claude process
 is gone; new lines after that put it back to following.
 
+A loop view follows a loop of headless sessions named <group>-<n> (grind loops:
+claude -p, one session per iteration, started by a systemd unit): whichever of
+them runs, from its last entries on, then the next. It is finished once the
+loop's driver unit has stopped (or, without one, after 10 idle minutes), and
+closes its whole tab, the unit's journal pane included.
+  {"mode": "loop", "group": …, "unit": driver unit or null, "state": watcher state file}
+
 A shell view prints the output file as it grows. It is finished once no process
 has the file open for writing any more.
 
@@ -265,6 +272,109 @@ class ShellView:
         return now - self.started > 5
 
 
+# --- grind loops ---------------------------------------------------------------
+
+SESSIONS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "sessions")
+PROJECTS_T = os.path.join(os.path.dirname(SESSIONS), "projects")
+CATCH_UP = 60  # entries of a session already under way that are shown on attaching
+
+
+class LoopView:
+    """A loop of headless sessions named <group>-<n>: follows whichever one is running."""
+
+    def __init__(self, spec):
+        self.group, self.unit, self.state = spec["group"], spec.get("unit"), spec.get("state")
+        title(self.group)
+        out(f"{BOLD}{self.group}{RESET}  {DIM}{self.unit or 'headless sessions'}{RESET}")
+        out(f"{DIM}{'─' * min(width(), 80)}{RESET}")
+        self.pattern = re.compile(re.escape(self.group) + r"-\d+")
+        self.cur = None            # {pid, name, path, pos, buf}
+        self.idle_since = time.time()
+        self.looked = 0.0
+        self.unit_at, self.unit_on = 0.0, bool(self.unit)
+        self.waiting_said = False
+
+    def live(self):
+        best = None
+        for path in os.listdir(SESSIONS) if os.path.isdir(SESSIONS) else []:
+            try:
+                with open(os.path.join(SESSIONS, path)) as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if self.pattern.fullmatch(str(d.get("name") or "")) and alive(d.get("pid")):
+                if not best or (d.get("startedAt") or 0) > (best.get("startedAt") or 0):
+                    best = d
+        return best
+
+    def attach(self, d):
+        hits = [os.path.join(PROJECTS_T, p, f"{d.get('sessionId')}.jsonl") for p in os.listdir(PROJECTS_T)]
+        hits = [h for h in hits if os.path.exists(h)]
+        if not hits:
+            return False  # no transcript yet
+        path = max(hits, key=os.path.getmtime)
+        started = time.strftime("%H:%M", time.localtime((d.get("startedAt") or 0) / 1000))
+        out(f"\n{CYAN}── {d.get('name')} · started {started}{RESET}")
+        with open(path, "rb") as f:
+            data = f.read()
+        lines = data.split(b"\n")
+        if len(lines) > CATCH_UP + 1:
+            out(f"{DIM}  … {len(lines) - CATCH_UP - 1} earlier entries{RESET}")
+            lines = lines[-(CATCH_UP + 1):]
+        *done, buf = lines
+        for line in done:
+            try:
+                render(json.loads(line))
+            except (ValueError, AttributeError, TypeError):
+                pass
+        self.cur = {"pid": d.get("pid"), "name": d.get("name"), "path": path, "pos": len(data), "buf": buf}
+        self.waiting_said = False
+        return True
+
+    def pump(self):
+        now, got = time.time(), False
+        if self.cur:
+            try:
+                with open(self.cur["path"], "rb") as f:
+                    f.seek(self.cur["pos"])
+                    data = f.read()
+            except OSError:
+                data = b""
+            if data:
+                got = True
+                self.cur["pos"] += len(data)
+                self.cur["buf"] += data
+                *lines, self.cur["buf"] = self.cur["buf"].split(b"\n")
+                for line in lines:
+                    try:
+                        render(json.loads(line))
+                    except (ValueError, AttributeError, TypeError):
+                        pass
+            elif not alive(self.cur["pid"]):
+                out(f"{DIM}── {self.cur['name']} ended{RESET}")
+                self.cur, self.idle_since = None, now
+        if not self.cur and now - self.looked >= 2:
+            self.looked = now
+            d = self.live()
+            if d and self.attach(d):
+                got = True
+            elif not self.waiting_said:
+                out(f"{DIM}  waiting for the next session …{RESET}")
+                self.waiting_said = True
+        return got
+
+    def finished(self):
+        if self.cur:
+            return False
+        now = time.time()
+        if self.unit and now - self.unit_at >= 10:
+            self.unit_at = now
+            r = subprocess.run(["systemctl", "--user", "is-active", self.unit], capture_output=True, text=True)
+            self.unit_on = r.stdout.strip() in ("active", "activating", "reloading")
+        idle = now - self.idle_since
+        return idle > 600 if not self.unit else (not self.unit_on and idle > 30)
+
+
 # --- main loop -----------------------------------------------------------------
 
 def key(timeout):
@@ -272,10 +382,19 @@ def key(timeout):
     return os.read(sys.stdin.fileno(), 16).decode(errors="ignore") if r else ""
 
 
-def close_pane():
+def close_pane(whole_tab=False):
     pane = os.environ.get("HERDR_PANE_ID")
-    if pane:
-        subprocess.run(["herdr", "pane", "close", pane], capture_output=True)
+    if not pane:
+        return
+    if whole_tab:  # a loop tab goes as a whole, journal pane included
+        r = subprocess.run(["herdr", "pane", "get", pane], capture_output=True, text=True)
+        try:
+            tab = json.loads(r.stdout)["result"]["pane"]["tab_id"]
+            subprocess.run(["herdr", "tab", "close", tab], capture_output=True)
+            return
+        except (ValueError, KeyError, TypeError):
+            pass
+    subprocess.run(["herdr", "pane", "close", pane], capture_output=True)
 
 
 def main():
@@ -290,7 +409,8 @@ def main():
         print(f"claude-herdr-view: {e}")
         return 1
     sys.stdout.write("\033[H\033[2J")
-    view = AgentView(spec) if spec.get("mode") == "agent" else ShellView(spec)
+    view = {"agent": AgentView, "loop": LoopView}.get(spec.get("mode"), ShellView)(spec)
+    natural = False
 
     tty_ok = sys.stdin.isatty()
     saved = termios.tcgetattr(sys.stdin) if tty_ok else None
@@ -318,11 +438,17 @@ def main():
                     out(f"{YELLOW}── working again{RESET}")
                     break
             else:
+                natural = True
                 return 0
     finally:
         if tty_ok:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
-        close_pane()
+        if spec.get("mode") == "loop" and natural and spec.get("state"):
+            try:  # the loop stopped: a new run of it may get a tab again
+                os.unlink(spec["state"])
+            except OSError:
+                pass
+        close_pane(whole_tab=spec.get("mode") == "loop")
 
 
 if __name__ == "__main__":

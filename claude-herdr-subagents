@@ -19,6 +19,9 @@ unreported tokens, and rows left without tokens, so nothing shows while a
 session has no subagents. Every report carries a TTL and is renewed while
 unchanged, so the rows also go away if this watcher stops.
 
+Grind loops (headless claude -p sessions named <loop>-<n>, run by a service)
+get a tab per loop in their project's space: see loop_tabs below.
+
 It also shows where each space's folder lies (token $path, rendered under the
 space's name by [ui.sidebar.spaces] in the herdr config), and names herdr's tabs
 instead of leaving them numbered: after the Claude
@@ -33,6 +36,7 @@ Usage: claude-herdr-subagents [--once]   (--once: one pass, print what it sends)
 """
 import glob
 import json
+import re
 import os
 import socket
 import subprocess
@@ -54,6 +58,9 @@ TTL_MS = 30_000   # tokens vanish this long after the last report
 REFRESH = 10      # s; renew the TTL of unchanged tokens this often
 PAD = "\u2800"  # braille blank: looks like a space, but herdr does not trim it
 PROJECTS = os.path.realpath(os.environ.get("CLAUDE_HERDR_PROJECTS") or f"{HOME}/Projects")
+HERE = os.path.dirname(os.path.realpath(__file__))
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "claude-herdr")
+LOOP_MIN_AGE = 30  # s a headless session runs before its loop gets a tab
 TAB_MAX = 24      # tab names are cut to this many characters
 NAMED = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "claude-herdr", "tab-names.json")
 TOKENS = ["subs", "sa_more"] + [f"sa{i}{s}" for i in range(1, ROWS + 1) for s in ("", "do")]
@@ -288,12 +295,129 @@ def space_paths(sock_path, panes, shown):
         del shown[wid]
 
 
+# --- grind loops ---------------------------------------------------------------
+# Headless Claude sessions (claude -p in a service, no terminal) named <loop>-<n>,
+# one per iteration, as grind loops start them, get one tab per loop in their
+# project's space: claude-herdr-view follows whichever session of the loop runs,
+# beside the journal of the unit that drives the loop (<unit>.service for sessions
+# running as <unit>-s<n>.service). The view closes the tab once the loop has
+# stopped; a loop tab closed by hand stays closed while that loop runs.
+
+def headless_loops():
+    """loop name -> {"cwd", "unit"} for live headless sessions named <loop>-<n>."""
+    loops, now_ms = {}, time.time() * 1000
+    for path in glob.glob(f"{SESSIONS_DIR}/*.json"):
+        try:
+            pid = int(os.path.basename(path)[:-5])
+            with open(path) as f:
+                d = json.load(f)
+            with open(f"/proc/{pid}/stat") as f:
+                tty_nr = int(f.read().rsplit(")", 1)[1].split()[4])
+        except (OSError, ValueError, IndexError):
+            continue
+        m = re.fullmatch(r"(.+)-\d+", str(d.get("name") or ""))
+        if tty_nr or not m or herdr_pane(pid) or now_ms - (d.get("startedAt") or now_ms) < LOOP_MIN_AGE * 1000:
+            continue
+        unit = None
+        try:
+            with open(f"/proc/{pid}/cgroup") as f:
+                u = re.fullmatch(r"(.+)-s\d+\.service", f.read().strip().rsplit("/", 1)[-1])
+            unit = u and u.group(1) + ".service"
+        except OSError:
+            pass
+        loops.setdefault(m.group(1), {"cwd": d.get("cwd") or HOME, "unit": unit})
+    return loops
+
+
+def unit_active(unit):
+    r = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True)
+    return r.stdout.strip() in ("active", "activating", "reloading")
+
+
+def herdr_cli(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=10)
+    try:
+        return json.loads(r.stdout).get("result") or {}
+    except ValueError:
+        return {}
+
+
+def open_loop_tab(name, info, state):
+    r = subprocess.run([os.path.join(HERE, "herdr-project-space"), info["cwd"]], capture_output=True, text=True)
+    ws = (r.stdout.split() or [None])[0]
+    if not ws:
+        return None
+    pane = (herdr_cli("tab", "create", "--workspace", ws, "--cwd", info["cwd"], "--label", name, "--no-focus")
+            .get("root_pane") or {}).get("pane_id")
+    if not pane:
+        return None
+    spec = os.path.join(STATE_DIR, f"view.{time.time_ns()}.json")
+    with open(spec, "w") as f:
+        json.dump({"mode": "loop", "group": name, "unit": info["unit"], "state": state}, f)
+    view = os.path.join(HERE, "claude-herdr-view")
+    herdr_cli("pane", "run", pane, f"exec {view} {spec}")
+    if info["unit"]:
+        side = (herdr_cli("pane", "split", pane, "--direction", "right", "--ratio", "0.62",
+                          "--cwd", info["cwd"], "--no-focus").get("pane") or {}).get("pane_id")
+        if side:
+            herdr_cli("pane", "run", side, f"exec journalctl --user -fu {info['unit']} -o cat -n 30")
+            herdr_cli("pane", "rename", side, "journal")
+    return pane
+
+
+def loop_tabs(pane_ids, checked):
+    """Open a tab for every running loop that has none; `checked` rate-limits unit checks."""
+    loops = headless_loops()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    for name, info in loops.items():
+        state = os.path.join(STATE_DIR, "loop-" + re.sub(r"[^A-Za-z0-9_.-]", "_", name) + ".json")
+        try:
+            with open(state) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            rec = None
+        if rec and (rec.get("pane") in pane_ids or rec.get("dismissed")):
+            continue
+        if rec:  # its pane is gone without the loop ending: closed by hand
+            rec["dismissed"] = True
+        else:
+            pane = open_loop_tab(name, info, state)
+            if not pane:
+                continue
+            rec = {"pane": pane, "loop": name, "unit": info["unit"]}
+        rec["seen"] = time.time()
+        with open(state, "w") as f:
+            json.dump(rec, f)
+    # Loops seen no more: forget them once stopped, so a new run gets a tab again.
+    now = time.time()
+    for state in glob.glob(os.path.join(STATE_DIR, "loop-*.json")):
+        try:
+            with open(state) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if rec.get("loop") in loops:
+            continue
+        unit = rec.get("unit")
+        if unit:
+            if now - checked.get(unit, 0) < 30:
+                continue
+            checked[unit] = now
+            if unit_active(unit):
+                continue
+        elif now - rec.get("seen", now) < 900:
+            continue
+        if rec.get("dismissed") or rec.get("pane") not in pane_ids:
+            os.unlink(state)
+
+
 def main():
     once = "--once" in sys.argv[1:]
     sent = {}     # (socket, pane) -> tokens last accepted
     renewed = {}  # (socket, pane) -> when the full set was last sent
     named = load_named()  # socket -> {tab id: name given}
     shown = {}            # socket -> {workspace id: (path, when reported)}
+    checked = {}          # loop driver unit -> when its state was last checked
     while True:
         now = time.time()
         want = {}
@@ -305,6 +429,11 @@ def main():
                 continue
             dirty |= name_tabs(sock_path, panes, named.setdefault(sock_path, {}))
             space_paths(sock_path, panes, shown.setdefault(sock_path, {}))
+            if sock_path == DEFAULT_SOCKET and not once:
+                try:
+                    loop_tabs({p.get("pane_id") for p in panes}, checked)
+                except (OSError, subprocess.SubprocessError) as e:
+                    log(f"loop tabs: {e!r}")
         if dirty and not once:
             os.makedirs(os.path.dirname(NAMED), exist_ok=True)
             with open(NAMED + ".tmp", "w") as f:
