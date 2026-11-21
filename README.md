@@ -49,6 +49,24 @@ it; any other directory is a project of its own.
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
 | `sidebar.toml` | The sidebar layouts that render the tokens (Claude agent rows, space paths) |
 
+## Grind loops
+
+A loop of headless Claude sessions gets a tab in its project's space when it keeps to this
+naming; nothing else needs setting up:
+
+- iteration *n* runs as a session named `<loop>-<n>` (`claude -p --name "<loop>-$n"`), without a
+  terminal, from the project directory;
+- for the journal pane: iteration *n* runs as the systemd unit `<driver>-s<n>`, started by the
+  unit `<driver>` that runs the loop.
+
+```bash
+# the driver, started once:  systemd-run --user --unit=mygrind ./loop.sh
+for ((n = 1; ; n++)); do
+  systemd-run --user --wait --collect --unit="mygrind-s$n" --working-directory="$PWD" \
+    claude -p --name "mygrind-$n" "…one iteration…"
+done
+```
+
 ## Requirements
 
 - herdr 0.9.5 or newer, server running (Omarchy starts it at login).
