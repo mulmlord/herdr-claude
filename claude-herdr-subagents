@@ -272,8 +272,12 @@ def space_paths(sock_path, panes, shown):
         wid, dirs = w.get("workspace_id"), by_ws.get(w.get("workspace_id")) or []
         if not dirs:
             continue
-        named = [d for d in dirs if os.path.basename(d) == w.get("label")]
-        path = tilde((named or dirs)[0])
+        label = str(w.get("label") or "")
+        if label and "/" not in label and os.path.isdir(os.path.join(PROJECTS, label)):
+            path = tilde(os.path.join(PROJECTS, label))  # a project's space, wherever its panes are
+        else:
+            named = [d for d in dirs if os.path.basename(d) == label]
+            path = tilde((named or dirs)[0])
         old = shown.get(wid)
         if old and old[0] == path and now - old[1] < REFRESH:
             continue

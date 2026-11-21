@@ -6,21 +6,23 @@
 # DIR (a fresh space), else into a new tab. Then the window of an attached herdr
 # client comes to the front, or a new herdr window opens when no client is attached.
 #
-# Usage: claude-herdr [--prompt TEXT] [--no-focus] [DIR] [-- CLAUDE_ARGS...]
+# Usage: claude-herdr [--prompt TEXT] [--no-focus] [--space SDIR] [DIR] [-- CLAUDE_ARGS...]
 #   DIR defaults to $PWD; $HOME becomes the projects root ($CLAUDE_HERDR_PROJECTS,
 #   default ~/Projects), since Claude never remembers trust for $HOME.
 #   CLAUDE_ARGS are passed on, e.g. --model haiku or --resume ID; without a
 #   --permission-mode among them Claude starts in auto mode.
-#   --no-focus leaves herdr's and Hyprland's focus alone. Prints the pane id.
+#   --no-focus leaves herdr's and Hyprland's focus alone. --space puts Claude into the
+#   space of SDIR's project while it still runs in DIR. Prints the pane id.
 set -uo pipefail
 
 root=${CLAUDE_HERDR_PROJECTS:-$HOME/Projects}
-prompt="" dir="" focus=true extra=()
+prompt="" dir="" space="" focus=true extra=()
 while (($#)); do
   case $1 in
     --prompt) prompt=${2:?--prompt needs a value}; shift 2 ;;
     --no-focus) focus=false; shift ;;
-    -h | --help) sed -n '2,15p' "$0" | cut -c3-; exit 0 ;;
+    --space) space=${2:?--space needs a directory}; shift 2 ;;
+    -h | --help) sed -n '2,16p' "$0" | cut -c3-; exit 0 ;;
     --) shift; extra=("$@"); break ;;
     *) dir=$1; shift ;;
   esac
@@ -30,6 +32,7 @@ if [[ $dir == "$HOME" ]]; then
   if [[ -d $root ]]; then dir=$root; elif [[ -d $HOME/Work ]]; then dir=$HOME/Work; fi
 fi
 dir=$(realpath -e -- "$dir") || exit 1
+space=$(realpath -e -- "${space:-$dir}") || exit 1
 
 fail() {
   notify-send -a herdr "claude-herdr" "$1" 2> /dev/null
@@ -46,7 +49,7 @@ if ! running; then
   running || fail "the herdr server did not start"
 fi
 
-read -r ws new < <(herdr-project-space "$dir")
+read -r ws new < <(herdr-project-space "$space")
 [[ -n ${ws:-} ]] || fail "no herdr space for $dir"
 
 # A fresh space's only pane, idle at a shell prompt in DIR, takes Claude; else a new tab.
@@ -66,11 +69,12 @@ if [[ -z $pane ]]; then
   [[ -n $pane ]] || fail "could not create a herdr pane in $dir"
 fi
 
-cmd=(claude)
-[[ " ${extra[*]} " =~ \ --permission-mode[=\ ] ]] || cmd+=(--permission-mode auto)
-cmd+=("${extra[@]}")
-[[ -n $prompt ]] && cmd+=(-- "$prompt")
-printf -v line '%q ' "${cmd[@]}"
+cmd2=(claude)
+[[ " ${extra[*]} " =~ \ --permission-mode[=\ ] ]] || cmd2+=(--permission-mode auto)
+cmd2+=("${extra[@]}")
+[[ -n $prompt ]] && cmd2+=(-- "$prompt")
+printf -v line '%q ' "${cmd2[@]}"
+[[ $dir == "$space" ]] || printf -v line 'cd %q && %s' "$dir" "$line"   # a pane of SDIR's space
 herdr pane run "$pane" "${line% }" > /dev/null || fail "could not start claude in $pane"
 echo "$pane"
 
@@ -78,33 +82,5 @@ $focus || exit 0
 herdr workspace focus "$ws" > /dev/null
 herdr tab focus "$(herdr pane get "$pane" | jq -r '.result.pane.tab_id')" > /dev/null
 
-# The window of an attached client: walk up from each herdr process but the
-# server until one owns a Hyprland window.
-clients=$(hyprctl clients -j)
-window=""
-for c in $(pgrep -x herdr); do
-  mapfile -d '' -t args < "/proc/$c/cmdline" 2> /dev/null || continue
-  [[ ${args[1]:-} == server ]] && continue
-  pid=$c
-  while [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1)); do
-    window=$(jq -c --argjson pid "$pid" 'first(.[] | select(.pid == $pid)) // empty' <<< "$clients")
-    [[ -n $window ]] && break 2
-    { stat=$(< "/proc/$pid/stat"); } 2> /dev/null || break
-    read -ra fields <<< "${stat##*) }" # ppid is the second field after "(comm)"
-    pid=${fields[1]}
-  done
-done
-
-if [[ -z $window ]]; then
-  exec omarchy-launch-tui --app-id=org.omarchy.agent herdr
-fi
-
-address=$(jq -r '.address' <<< "$window")
-workspace=$(jq -r '.workspace.name' <<< "$window")
-if [[ $workspace == special:* ]]; then
-  shown=$(hyprctl monitors -j | jq -r --arg ws "$workspace" 'any(.[]; .specialWorkspace.name == $ws)')
-  [[ $shown == true ]] || hyprctl dispatch "hl.dsp.workspace.toggle_special(\"${workspace#special:}\")" > /dev/null
-else
-  hyprctl dispatch "hl.dsp.focus({ workspace = \"$(jq -r '.workspace.id' <<< "$window")\" })" > /dev/null
-fi
-exec hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" > /dev/null
+# The main herdr window to the front, or a new one when no client is attached.
+herdr-window --focus > /dev/null || exec omarchy-launch-tui --app-id=org.omarchy.agent herdr

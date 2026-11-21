@@ -15,6 +15,8 @@ several for a logout.
 Usage:
   claude-herdr-move                     list the sessions in windows and whether each can move now
   claude-herdr-move NAME|PID|all...     move those that can move now
+  claude-herdr-move ... --space DIR     resume them in the space of DIR's project instead of their
+                                        own directory's (they keep running in their directory)
   claude-herdr-move ... --wait          also keep waiting for the others and move each one once it
                                         has been idle for 2 minutes (a draft typed into it would be
                                         lost); ends when none are left. Run it detached:
@@ -139,7 +141,7 @@ def label(s):
     return f"{s.get('name') or s['sessionId'][:8]} ({s['pid']}, {s.get('cwd', '').replace(HOME, '~')})"
 
 
-def move(s, w):
+def move(s, w, space=None):
     pid, sid, cwd = s["pid"], s["sessionId"], s.get("cwd") or HOME
     mode, model = transcript_meta(transcript(sid))
     subprocess.run(["hyprctl", "dispatch", f'hl.dsp.window.close({{ window = "address:{w["address"]}" }})'],
@@ -152,7 +154,8 @@ def move(s, w):
         log(f"{label(s)}: still running after its window was asked to close; not resumed")
         return False
     args = ["--resume", sid] + (["--model", model] if model else []) + (["--permission-mode", mode] if mode else [])
-    r = subprocess.run([CLAUDE_HERDR, "--no-focus", cwd, "--", *args], capture_output=True, text=True)
+    where = ["--space", space] if space else []
+    r = subprocess.run([CLAUDE_HERDR, "--no-focus", *where, cwd, "--", *args], capture_output=True, text=True)
     if r.returncode:
         log(f"{label(s)}: window closed, but resuming in herdr failed: {r.stderr.strip()}")
         log(f"  resume it by hand: claude-herdr {cwd} -- {' '.join(args)}")
@@ -164,6 +167,14 @@ def move(s, w):
 
 def main(argv):
     wait = "--wait" in argv
+    space = None
+    if "--space" in argv:
+        i = argv.index("--space")
+        if i + 1 >= len(argv):
+            print("--space needs a directory")
+            return 2
+        space = os.path.realpath(os.path.expanduser(argv[i + 1]))
+        argv = argv[:i] + argv[i + 2:]
     targets = [a for a in argv if a != "--wait"]
     if any(a in ("-h", "--help") for a in targets):
         print(__doc__.strip())
@@ -196,7 +207,7 @@ def main(argv):
                     pending.discard(pid)
                 continue
             time.sleep(max(0.0, last + SPACING - time.time()))
-            move(s, w)
+            move(s, w, space)
             last = time.time()
             pending.discard(pid)
         if pending:

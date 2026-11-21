@@ -38,12 +38,13 @@ it; any other directory is a project of its own.
 | File | What it does |
 |---|---|
 | `herdr-project-space` | Prints the space of a directory's project, creating it when missing; `--focus` switches herdr to it. `herdr-project-space [--focus] [DIR]` |
-| `herdr-here` | herdr in a new terminal, on the space of the focused terminal's project (for Omarchy's SUPER+CTRL+RETURN) |
-| `claude-herdr` | Opens Claude in its project's space: in the space's only pane when that idles at a shell prompt in the directory (a fresh space), else in a new tab; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [--no-focus] [DIR] [-- CLAUDE_ARGS...]`; `$HOME` becomes the projects root. |
-| `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes. `claude-herdr-move` alone lists them. |
+| `herdr-window` | The main herdr window: herdr keeps one session that every client shows, so one window is enough, the client attached longest. Prints its address; `--focus` brings it forward. The launchers here use it instead of attaching another client. |
+| `herdr-here` | The main herdr window on the space of the focused terminal's project (for Omarchy's SUPER+CTRL+RETURN); a herdr terminal only opens when no herdr window exists |
+| `claude-herdr` | Opens Claude in its project's space: in the space's only pane when that idles at a shell prompt in the directory (a fresh space), else in a new tab; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [--no-focus] [--space SDIR] [DIR] [-- CLAUDE_ARGS...]`; `$HOME` becomes the projects root, and `--space` puts Claude into another project's space while it runs in DIR. |
+| `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes; `--space DIR` puts them into DIR's project space. `claude-herdr-move` alone lists them. |
 | `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: a starting subagent gets a new tab in the session's space, named after its task; a background shell gets a pane beside the work of the agent that started it (beside the main Claude pane for the session itself), further shells stacking below. Nothing takes the focus. Returns at once outside herdr (~10 ms per Bash call). |
 | `claude-herdr-view` | Runs in those panes: follows a subagent's transcript (prompt, text, tool calls with the start of each result, its final report) or a shell's output file. When the work ends it closes its pane after `$CLAUDE_HERDR_LINGER` s (default 120; `q` closes now, `k` keeps it), and a tab goes with its last pane. |
-| `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. It also puts each space's folder under its name in the sidebar (`$path`, e.g. `~/Projects/herdr-claude`), and names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
+| `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. It also puts each space's folder under its name in the sidebar (`$path`, e.g. `~/Projects/herdr-claude`; a space named after a folder in the projects root shows that folder), and names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
 | `sidebar.toml` | The sidebar layouts that render the tokens (Claude agent rows, space paths) |
 
@@ -60,7 +61,7 @@ it; any other directory is a project of its own.
 
 ```bash
 for f in claude-herdr claude-herdr-subagents claude-herdr-move claude-herdr-tabs claude-herdr-view \
-         herdr-project-space herdr-here; do
+         herdr-project-space herdr-here herdr-window; do
   ln -s "$PWD/$f" ~/.local/bin/
 done
 ln -s "$PWD/claude-herdr-subagents.service" ~/.config/systemd/user/
@@ -84,7 +85,7 @@ o.bind("SUPER + ALT + H", "Claude Code (herdr)", "claude-herdr")
 o.rebind("SUPER + CTRL + RETURN", "Herdr (project space)", "herdr-here")
 ```
 
-And so that a plain `herdr` typed in a project opens on its space, in `~/.bashrc`. Inside herdr, where a nested herdr is refused, it switches the running herdr to that space instead:
+And so that a plain `herdr` typed in a project shows its space in the main herdr window, in `~/.bashrc`: inside herdr (where a nested herdr is refused) it switches the running herdr, outside it brings the main window forward, and only without any herdr window does it attach here:
 
 ```bash
 herdr() {
@@ -95,6 +96,7 @@ herdr() {
       [[ -n $ws ]] || echo "herdr: no project space for $PWD" >&2
       return
     fi
+    herdr-window --focus > /dev/null && return
   fi
   command herdr "$@"
 }

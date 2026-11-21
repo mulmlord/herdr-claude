@@ -1,0 +1,44 @@
+#!/bin/bash
+# herdr-window: the Hyprland window of the main herdr client, if one is attached.
+#
+# herdr's server keeps one session; every attached client shows the same spaces, so
+# one window is enough. The main window is the client attached longest; the
+# launchers here bring it forward instead of attaching another one.
+#
+# Usage: herdr-window [--focus]
+#   Prints the window's address; --focus brings it to the front (switching to its
+#   workspace, or showing it when it lives on a special workspace). Exits 1 when no
+#   herdr client has a window.
+set -uo pipefail
+
+focus=false
+[[ ${1:-} == --focus ]] && focus=true
+
+clients=$(hyprctl clients -j) || exit 1
+window=""
+# Oldest client first: ps sorts by start time.
+for c in $(ps -o pid= --sort=start_time -C herdr); do
+  mapfile -d '' -t args < "/proc/$c/cmdline" 2> /dev/null || continue
+  [[ ${args[1]:-} == server ]] && continue
+  pid=$c
+  while [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1)); do
+    window=$(jq -c --argjson pid "$pid" 'first(.[] | select(.pid == $pid)) // empty' <<< "$clients")
+    [[ -n $window ]] && break 2
+    { stat=$(< "/proc/$pid/stat"); } 2> /dev/null || break
+    read -ra fields <<< "${stat##*) }" # ppid is the second field after "(comm)"
+    pid=${fields[1]}
+  done
+done
+[[ -n $window ]] || exit 1
+
+address=$(jq -r '.address' <<< "$window")
+echo "$address"
+$focus || exit 0
+workspace=$(jq -r '.workspace.name' <<< "$window")
+if [[ $workspace == special:* ]]; then
+  shown=$(hyprctl monitors -j | jq -r --arg ws "$workspace" 'any(.[]; .specialWorkspace.name == $ws)')
+  [[ $shown == true ]] || hyprctl dispatch "hl.dsp.workspace.toggle_special(\"${workspace#special:}\")" > /dev/null
+else
+  hyprctl dispatch "hl.dsp.focus({ workspace = \"$(jq -r '.workspace.id' <<< "$window")\" })" > /dev/null
+fi
+hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" > /dev/null

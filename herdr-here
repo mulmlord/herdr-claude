@@ -1,6 +1,8 @@
 #!/bin/bash
-# herdr-here: herdr in a new terminal, on the space of the project the focused
-# terminal is in (created when missing). Omarchy's SUPER+CTRL+RETURN does the same
-# without the space; bind this instead.
+# herdr-here: the main herdr window on the space of the project the focused terminal is
+# in (created when missing). Omarchy's SUPER+CTRL+RETURN opens a plain herdr terminal
+# each time; bind this instead. A new herdr terminal only opens when no herdr window
+# exists yet.
 herdr-project-space --focus "$(omarchy-cmd-terminal-cwd)" > /dev/null
+herdr-window --focus > /dev/null && exit 0
 exec omarchy-launch-terminal herdr
