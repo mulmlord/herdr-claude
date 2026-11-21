@@ -1,0 +1,208 @@
+#!/usr/bin/python3 -I
+"""claude-herdr-move: move Claude Code sessions from their terminal windows into herdr.
+
+A process can't change terminals, so a move closes the session's window and
+resumes the conversation (claude --resume, same model and permission mode) in
+its project's herdr space through claude-herdr. That is only safe while nothing
+runs in the session: no turn in progress, no question open, no background shells
+or subagents, which would die with the process. Sessions parked in a background
+job are left alone, as are sessions without a window (claude -p in services).
+
+The window is closed as SUPER+W would, so claude-revive sees an idle session's
+window closed and leaves it closed; moves are spaced out so it never mistakes
+several for a logout.
+
+Usage:
+  claude-herdr-move                     list the sessions in windows and whether each can move now
+  claude-herdr-move NAME|PID|all...     move those that can move now
+  claude-herdr-move ... --wait          also keep waiting for the others and move each one once it
+                                        has been idle for 2 minutes (a draft typed into it would be
+                                        lost); ends when none are left. Run it detached:
+      systemd-run --user --unit claude-herdr-move ~/.local/bin/claude-herdr-move all --wait
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config"
+SESSIONS_SH = f"{XDG_CONFIG}/omarchy/plugins/mulm.claude-sessions/sessions.sh"
+CLAUDE_HERDR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "claude-herdr")
+WAIT_IDLE = 120   # s idle before --wait moves a session
+SPACING = 6       # s between moves; claude-revive takes windows closing within 4 s for a logout
+POLL = 15
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def sessions():
+    r = subprocess.run([SESSIONS_SH], capture_output=True, text=True, timeout=20, cwd=HOME)
+    data = json.loads(r.stdout or "[]")
+    return [s for s in data if isinstance(s, dict) and s.get("kind") == "interactive" and s.get("sessionId")]
+
+
+def environ(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return f.read().split(b"\0")
+    except OSError:
+        return []
+
+
+def ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def window_of(pid, clients):
+    by_pid = {c.get("pid"): c for c in clients}
+    while pid > 1:
+        if pid in by_pid:
+            return by_pid[pid]
+        pid = ppid(pid)
+    return None
+
+
+def transcript(sid):
+    hits = glob.glob(f"{CONFIG}/projects/*/{sid}.jsonl")
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def transcript_meta(path):
+    """Last permission mode and main-chain model, from the transcript's tail (as claude-revive does)."""
+    mode = model = None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 2_000_000))
+            lines = f.read().split(b"\n")
+    except (OSError, TypeError):
+        return mode, model
+    for line in reversed(lines):
+        if not mode:
+            m = re.search(rb'"permissionMode":"([A-Za-z]+)"', line)
+            if m:
+                mode = m.group(1).decode()
+        if not model and b'"type":"assistant"' in line:
+            m = re.search(rb'"model":"(claude-[^"<]+)"', line)
+            if m:
+                model = m.group(1).decode()
+        if mode and model:
+            break
+    return mode, model
+
+
+def candidates():
+    """Sessions in a Hyprland window, outside herdr: (session, window)."""
+    clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True).stdout or "[]")
+    out = []
+    for s in sessions():
+        pid = s.get("pid")
+        if not isinstance(pid, int) or any(v.startswith(b"HERDR_PANE_ID=") for v in environ(pid)):
+            continue
+        w = window_of(pid, clients)
+        if w:
+            out.append((s, w))
+    return out
+
+
+def blocker(s, idle_for=0):
+    """Why the session can't move now, or None."""
+    if s.get("jobSessionId"):
+        return "parked in a background job"
+    if s.get("status") != "idle":
+        return {"busy": "in a turn", "waiting": "waiting for an answer", "asking": "asking you something",
+                "shell": "waiting on background work"}.get(s.get("status"), s.get("status") or "unknown")
+    if s.get("agents"):
+        return f"{len(s['agents'])} subagent(s) running"
+    if s.get("shells"):
+        return f"{len(s['shells'])} background shell(s) running"
+    if idle_for:
+        t = transcript(s["sessionId"])
+        since = max(s.get("statusUpdatedAt") or 0, (os.path.getmtime(t) * 1000) if t else 0)
+        if time.time() * 1000 - since < idle_for * 1000:
+            return "idle for less than 2 minutes"
+    return None
+
+
+def label(s):
+    return f"{s.get('name') or s['sessionId'][:8]} ({s['pid']}, {s.get('cwd', '').replace(HOME, '~')})"
+
+
+def move(s, w):
+    pid, sid, cwd = s["pid"], s["sessionId"], s.get("cwd") or HOME
+    mode, model = transcript_meta(transcript(sid))
+    subprocess.run(["hyprctl", "dispatch", f'hl.dsp.window.close({{ window = "address:{w["address"]}" }})'],
+                   capture_output=True)
+    for _ in range(40):
+        if not os.path.exists(f"/proc/{pid}"):
+            break
+        time.sleep(0.25)
+    else:
+        log(f"{label(s)}: still running after its window was asked to close; not resumed")
+        return False
+    args = ["--resume", sid] + (["--model", model] if model else []) + (["--permission-mode", mode] if mode else [])
+    r = subprocess.run([CLAUDE_HERDR, "--no-focus", cwd, "--", *args], capture_output=True, text=True)
+    if r.returncode:
+        log(f"{label(s)}: window closed, but resuming in herdr failed: {r.stderr.strip()}")
+        log(f"  resume it by hand: claude-herdr {cwd} -- {' '.join(args)}")
+        return False
+    log(f"{label(s)}: moved to herdr pane {r.stdout.strip()} ({model or 'default model'}, {mode or 'auto'})")
+    subprocess.run(["notify-send", "-a", "herdr", "Moved to herdr", s.get("name") or sid[:8]], capture_output=True)
+    return True
+
+
+def main(argv):
+    wait = "--wait" in argv
+    targets = [a for a in argv if a != "--wait"]
+    if any(a in ("-h", "--help") for a in targets):
+        print(__doc__.strip())
+        return 0
+    if not targets:
+        for s, _ in candidates():
+            why = blocker(s)
+            print(f"{label(s)}: {'can move now' if not why else 'not now, ' + why}")
+        return 0
+
+    def wanted(s):
+        return "all" in targets or str(s["pid"]) in targets or s.get("name") in targets or s["sessionId"] in targets
+
+    pending = {s["pid"] for s, _ in candidates() if wanted(s)}
+    if not pending:
+        log("no matching session in a terminal window")
+        return 1
+    last = 0.0
+    while pending:
+        live = {s["pid"]: (s, w) for s, w in candidates()}
+        for pid in sorted(pending):
+            if pid not in live:
+                pending.discard(pid)  # ended, or already in herdr
+                continue
+            s, w = live[pid]
+            why = blocker(s, WAIT_IDLE if wait else 0)
+            if why:
+                if not wait or s.get("jobSessionId"):  # a parked session never becomes movable
+                    log(f"{label(s)}: not moved, {why}")
+                    pending.discard(pid)
+                continue
+            time.sleep(max(0.0, last + SPACING - time.time()))
+            move(s, w)
+            last = time.time()
+            pending.discard(pid)
+        if pending:
+            time.sleep(POLL)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

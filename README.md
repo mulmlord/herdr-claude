@@ -21,9 +21,16 @@ herdr's pane metadata tokens and a sidebar layout for Claude.
 
 ## Parts
 
+Every project gets a herdr space of its own, named after it. A directory below the projects root
+(`$CLAUDE_HERDR_PROJECTS`, default `~/Projects`) belongs to the project at the first level under
+it; any other directory is a project of its own.
+
 | File | What it does |
 |---|---|
-| `claude-herdr` | Opens Claude in herdr: a new tab in the workspace of its project (a workspace with some pane already in that directory), else a new workspace; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [DIR] [-- CLAUDE_ARGS...]` |
+| `herdr-project-space` | Prints the space of a directory's project, creating it when missing; `--focus` switches herdr to it. `herdr-project-space [--focus] [DIR]` |
+| `herdr-here` | herdr in a new terminal, on the space of the focused terminal's project (for Omarchy's SUPER+CTRL+RETURN) |
+| `claude-herdr` | Opens Claude in its project's space: in the space's only pane when that idles at a shell prompt in the directory (a fresh space), else in a new tab; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [--no-focus] [DIR] [-- CLAUDE_ARGS...]`; `$HOME` becomes the projects root. |
+| `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes. `claude-herdr-move` alone lists them. |
 | `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. `--once` does one pass and prints what it sends. Idle cost is a glance at `~/.claude/sessions`. |
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
 | `sidebar.toml` | The sidebar layout that renders the tokens |
@@ -40,17 +47,31 @@ herdr's pane metadata tokens and a sidebar layout for Claude.
 ## Install
 
 ```bash
-ln -s "$PWD/claude-herdr" "$PWD/claude-herdr-subagents" ~/.local/bin/
+for f in claude-herdr claude-herdr-subagents claude-herdr-move herdr-project-space herdr-here; do
+  ln -s "$PWD/$f" ~/.local/bin/
+done
 ln -s "$PWD/claude-herdr-subagents.service" ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now claude-herdr-subagents
 cat sidebar.toml >> ~/.config/herdr/config.toml && herdr server reload-config
 herdr integration install claude   # herdr resumes Claude sessions after a restart
 ```
 
-Bind `claude-herdr` to a key, e.g. in `~/.config/hypr/bindings.lua`:
+Keys, e.g. in `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + ALT + H", "Claude Code (herdr)", "claude-herdr")
+o.rebind("SUPER + CTRL + RETURN", "Herdr (project space)", "herdr-here")
+```
+
+And so that a plain `herdr` typed in a project opens on its space, in `~/.bashrc`:
+
+```bash
+herdr() {
+  if (($# == 0)) && [[ -z ${HERDR_ENV:-} ]] && command -v herdr-project-space > /dev/null; then
+    herdr-project-space --focus "$PWD" > /dev/null
+  fi
+  command herdr "$@"
+}
 ```
 
 ## Notes

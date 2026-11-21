@@ -1,0 +1,43 @@
+#!/bin/bash
+# herdr-project-space: the herdr space of a directory's project, created when missing.
+#
+# A directory below the projects root ($CLAUDE_HERDR_PROJECTS, default ~/Projects)
+# belongs to the project at the first level under it; any other directory is a
+# project of its own, except $HOME, which has none. A project's space is the one
+# named after the project directory; a new one gets that name and starts in DIR.
+#
+# Usage: herdr-project-space [--focus] [DIR]
+#   Prints the space's workspace id, followed by " new" when it was just created.
+#   --focus switches herdr to it. DIR defaults to $PWD. Prints nothing for $HOME,
+#   or when the herdr server is not running.
+set -uo pipefail
+
+focus=false dir=""
+for a; do
+  case $a in
+    --focus) focus=true ;;
+    -h | --help) sed -n '2,12p' "$0" | cut -c3-; exit 0 ;;
+    *) dir=$a ;;
+  esac
+done
+dir=$(realpath -e -- "${dir:-$PWD}") || exit 1
+root=$(realpath -m -- "${CLAUDE_HERDR_PROJECTS:-$HOME/Projects}")
+[[ $dir == "$HOME" ]] && exit 0
+
+case $dir/ in
+  "$root"/?*/*) rel=${dir#"$root"/}; project=$root/${rel%%/*} ;;
+  *) project=$dir ;;
+esac
+label=${project##*/}
+
+[[ $(herdr status server --json 2> /dev/null | jq -r '.running') == true ]] || exit 0
+
+new=""
+ws=$(herdr workspace list | jq -r --arg l "$label" 'first(.result.workspaces[] | select(.label == $l) | .workspace_id) // empty')
+if [[ -z $ws ]]; then
+  ws=$(herdr workspace create --cwd "$dir" --label "$label" --no-focus | jq -r '.result.workspace.workspace_id // empty')
+  [[ -n $ws ]] || exit 1
+  new=" new"
+fi
+$focus && herdr workspace focus "$ws" > /dev/null
+echo "$ws$new"
