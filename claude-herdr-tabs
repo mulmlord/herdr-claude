@@ -1,0 +1,144 @@
+#!/bin/bash
+# claude-herdr-tabs: Claude Code hook that lays out the agents of a session running
+# in herdr: each subagent gets a tab of its own in the session's space, and every
+# background shell shows up beside the work of the agent that started it.
+#
+#   a subagent starts     new tab named after its task, following its transcript
+#                         (claude-herdr-view agent); the tab doesn't take the focus
+#   a background shell    a pane beside the starting agent's work (for the session
+#                         itself, beside the main Claude pane) following the shell's
+#                         output (claude-herdr-view shell); later shells of the same
+#                         agent stack below the first
+#   a subagent stops      its view notes it. Views close their pane a while after
+#                         the work ends ($CLAUDE_HERDR_LINGER s, default 120); a tab
+#                         goes with its last pane
+#
+# Hooks in ~/.claude/settings.json:
+#   SubagentStart                   claude-herdr-tabs agent-start
+#   SubagentStop                    claude-herdr-tabs agent-stop
+#   PostToolUse, matcher Bash       claude-herdr-tabs shell
+# Outside herdr (no HERDR_PANE_ID) it returns at once. Inside, the work runs
+# detached so Claude never waits on herdr.
+set -uo pipefail
+
+state=${XDG_RUNTIME_DIR:-/tmp/claude-herdr-$UID}/claude-herdr
+here=$(dirname "$(readlink -f "$0")")
+
+if [[ ${1:-} != _work ]]; then
+  input=$(cat)
+  [[ -n ${HERDR_PANE_ID:-} ]] || exit 0
+  [[ ${1:-} != shell || $input == *'"backgroundTaskId"'* ]] || exit 0
+  mkdir -p "$state"
+  f=$(mktemp "$state/hook.XXXXXX") || exit 0
+  printf '%s' "$input" > "$f"
+  # The claude process this hook runs for: the first ancestor named claude.
+  p=$PPID cpid=""
+  while ((p > 1)); do
+    read -r comm < "/proc/$p/comm" 2> /dev/null || break
+    [[ $comm == claude ]] && { cpid=$p; break; }
+    { stat=$(< "/proc/$p/stat"); } 2> /dev/null || break
+    read -ra fields <<< "${stat##*) }"
+    p=${fields[1]}
+  done
+  setsid bash "$0" _work "${1:-}" "$f" "$cpid" < /dev/null > /dev/null 2>&1 &
+  exit 0
+fi
+
+# --- detached part -----------------------------------------------------------
+event=$2 f=$3 cpid=$4
+trap 'rm -f "$f"' EXIT
+exec 2>> "$state/hooks.log"
+j() { jq -r "$1 // empty" "$f"; }
+short() { local s=${1//$'\n'/ }; ((${#s} > 32)) && s="${s:0:31}…"; printf '%s' "$s"; }
+spec() { # write a view spec, print its path
+  local path=$state/view.$(date +%s%N).json
+  jq -n "$@" > "$path" && printf '%s' "$path"
+}
+start_view() { # pane spec
+  herdr pane run "$1" "exec $(printf %q "$here/claude-herdr-view") $(printf %q "$2")" > /dev/null
+}
+alive() { herdr pane get "$1" > /dev/null 2>&1; }
+
+sid=$(j .session_id)
+aid=$(j .agent_id)
+cwd=$(j .cwd)
+[[ -n $sid ]] || exit 0
+
+case $event in
+  agent-start)
+    [[ -n $aid ]] || exit 0
+    # A background agent that wakes up again (its shell ended, a message came) starts
+    # once more: while its tab is still open, the view there just goes on.
+    if [[ -s $state/$sid-$aid.work ]] && alive "$(< "$state/$sid-$aid.work")"; then
+      exit 0
+    fi
+    tp=$(j .transcript_path)
+    at=${tp%.jsonl}/subagents/agent-$aid.jsonl
+    meta=${at%.jsonl}.meta.json
+    for _ in {1..30}; do [[ -s $meta ]] && break; sleep 0.1; done
+    desc=$(jq -r '.description // empty' "$meta" 2> /dev/null)
+    type=$(j .agent_type)
+    ws=$(herdr pane get "$HERDR_PANE_ID" | jq -r '.result.pane.workspace_id // empty')
+    [[ -n $ws ]] || exit 0
+    pane=$(herdr tab create --workspace "$ws" --cwd "${cwd:-$HOME}" --label "$(short "${desc:-${type:-agent}}")" --no-focus |
+      jq -r '.result.root_pane.pane_id // empty')
+    [[ -n $pane ]] || exit 0
+    echo "$pane" > "$state/$sid-$aid.work"
+    s=$(spec --arg t "$at" --arg m "$meta" --arg d "$state/$sid-$aid.done" --arg p "$cpid" \
+      --arg type "$type" --arg desc "$desc" \
+      '{mode: "agent", transcript: $t, meta: $m, done: $d, pid: $p, type: $type, description: $desc}')
+    start_view "$pane" "$s"
+    ;;
+
+  agent-stop)
+    [[ -n $aid ]] && touch "$state/$sid-$aid.done"
+    ;;
+
+  shell)
+    tid=$(j .tool_response.backgroundTaskId)
+    [[ -n $tid ]] || exit 0
+    out=""
+    for _ in {1..30}; do
+      out=$(compgen -G "${TMPDIR:-/tmp}/claude-$UID/*/$sid/tasks/$tid.output" | head -1)
+      [[ -n $out ]] || out=$(compgen -G "/tmp/claude-$UID/*/*/tasks/$tid.output" | head -1)
+      [[ -n $out ]] && break
+      sleep 0.1
+    done
+    [[ -n $out ]] || exit 0
+    desc=$(j .tool_input.description)
+    cmd=$(j .tool_input.command)
+
+    # Whose work it sits beside: the subagent's tab (once it is there), else the main pane.
+    key=main work=$HERDR_PANE_ID owner=main
+    if [[ -n $aid ]]; then
+      for _ in {1..50}; do [[ -s $state/$sid-$aid.work ]] && break; sleep 0.1; done
+      if [[ -s $state/$sid-$aid.work ]]; then
+        key=$aid work=$(< "$state/$sid-$aid.work")
+        meta=$(compgen -G "$HOME/.claude/projects/*/$sid/subagents/agent-$aid.meta.json" | head -1)
+        owner=$(jq -r '.description // .agentType // empty' "$meta" 2> /dev/null)
+        owner=${owner:-agent}
+      fi
+    fi
+
+    exec 9> "$state/$sid-$key.lock"
+    flock -w 10 9
+    shells=$state/$sid-$key.shells
+    anchor=""
+    if [[ -s $shells ]]; then
+      while read -r p; do alive "$p" && anchor=$p; done < "$shells"
+    fi
+    if [[ -n $anchor ]]; then
+      new=$(herdr pane split "$anchor" --direction down --ratio 0.5 --cwd "${cwd:-$HOME}" --no-focus)
+    else
+      new=$(herdr pane split "$work" --direction right --ratio 0.62 --cwd "${cwd:-$HOME}" --no-focus)
+    fi
+    pane=$(jq -r '.result.pane.pane_id // empty' <<< "$new")
+    [[ -n $pane ]] || exit 0
+    echo "$pane" >> "$shells"
+    flock -u 9
+    herdr pane rename "$pane" "$(short "${desc:-${cmd%%$'\n'*}}")" > /dev/null 2>&1
+    s=$(spec --arg o "$out" --arg p "$cpid" --arg desc "$desc" --arg cmd "$cmd" --arg owner "$owner" --arg id "$tid" \
+      '{mode: "shell", output: $o, pid: $p, description: $desc, command: $cmd, owner: $owner, id: $id}')
+    start_view "$pane" "$s"
+    ;;
+esac

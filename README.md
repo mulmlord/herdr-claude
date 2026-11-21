@@ -1,7 +1,8 @@
 # herdr-claude
 
-Claude Code sessions in [herdr](https://herdr.dev) instead of a terminal window each, with the
-subagents of every session in herdr's sidebar under the session's entry.
+Claude Code sessions in [herdr](https://herdr.dev) instead of a terminal window each: one space
+per project, every subagent in a tab of its own with the background shells it starts beside its
+work, and the subagents of each session in herdr's sidebar under the session's entry.
 
 ```
  ● my-project
@@ -16,8 +17,17 @@ subagents of every session in herdr's sidebar under the session's entry.
 ```
 
 Claude Code runs its subagents (Agent tool, forks, workflow agents) inside the session's own
-process, so herdr only ever sees one agent per pane. A small watcher fills in the rest through
-herdr's pane metadata tokens and a sidebar layout for Claude.
+process, so herdr only ever sees one agent per pane. Hooks and a small watcher fill in the rest:
+a viewer follows each subagent's transcript and each background shell's output file in panes of
+their own, and herdr's pane metadata tokens put the subagents in the sidebar.
+
+```
+ tab 1  claude (main session)            │ main: watch the bench
+                                         │ (output of a shell the session started)
+ tab 2  find callers of verify()         │ find callers…: cargo test
+        ● Grep verify\( in src/          │ (output of a shell that agent started)
+          │ src/auth.rs:42: verify(…)    │
+```
 
 ## Parts
 
@@ -31,6 +41,8 @@ it; any other directory is a project of its own.
 | `herdr-here` | herdr in a new terminal, on the space of the focused terminal's project (for Omarchy's SUPER+CTRL+RETURN) |
 | `claude-herdr` | Opens Claude in its project's space: in the space's only pane when that idles at a shell prompt in the directory (a fresh space), else in a new tab; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [--no-focus] [DIR] [-- CLAUDE_ARGS...]`; `$HOME` becomes the projects root. |
 | `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes. `claude-herdr-move` alone lists them. |
+| `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: a starting subagent gets a new tab in the session's space, named after its task; a background shell gets a pane beside the work of the agent that started it (beside the main Claude pane for the session itself), further shells stacking below. Nothing takes the focus. Returns at once outside herdr (~10 ms per Bash call). |
+| `claude-herdr-view` | Runs in those panes: follows a subagent's transcript (prompt, text, tool calls with the start of each result, its final report) or a shell's output file. When the work ends it closes its pane after `$CLAUDE_HERDR_LINGER` s (default 120; `q` closes now, `k` keeps it), and a tab goes with its last pane. |
 | `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. `--once` does one pass and prints what it sends. Idle cost is a glance at `~/.claude/sessions`. |
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
 | `sidebar.toml` | The sidebar layout that renders the tokens |
@@ -47,13 +59,22 @@ it; any other directory is a project of its own.
 ## Install
 
 ```bash
-for f in claude-herdr claude-herdr-subagents claude-herdr-move herdr-project-space herdr-here; do
+for f in claude-herdr claude-herdr-subagents claude-herdr-move claude-herdr-tabs claude-herdr-view \
+         herdr-project-space herdr-here; do
   ln -s "$PWD/$f" ~/.local/bin/
 done
 ln -s "$PWD/claude-herdr-subagents.service" ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now claude-herdr-subagents
 cat sidebar.toml >> ~/.config/herdr/config.toml && herdr server reload-config
 herdr integration install claude   # herdr resumes Claude sessions after a restart
+```
+
+Hooks for the agent tabs, in `~/.claude/settings.json` (new sessions pick them up):
+
+```json
+"SubagentStart": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/claude-herdr-tabs agent-start", "timeout": 10 }] }],
+"SubagentStop":  [{ "hooks": [{ "type": "command", "command": "~/.local/bin/claude-herdr-tabs agent-stop", "timeout": 10 }] }],
+"PostToolUse":   [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/.local/bin/claude-herdr-tabs shell", "timeout": 10 }] }]
 ```
 
 Keys, e.g. in `~/.config/hypr/bindings.lua`:
@@ -87,6 +108,8 @@ herdr() {
 - After a restart herdr resumes `claude --resume <id>` once a client attaches, with the default
   model and permission mode from your settings.
 - Rows are cut at the sidebar width; drag the sidebar border wider to see more.
+- A shell view shows what the command writes to its output file. Wrappers that hold output back
+  until the command ends (output condensers such as rtk) make it appear only at the end.
 
 ## License
 

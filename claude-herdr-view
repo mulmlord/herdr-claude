@@ -1,0 +1,333 @@
+#!/usr/bin/python3 -I
+"""claude-herdr-view: follow a Claude subagent's work or a background shell's output in a herdr pane.
+
+Started by claude-herdr-tabs with a JSON spec file (deleted once read):
+  {"mode": "agent", "transcript": …, "meta": …, "done": marker, "pid": claude pid, "type", "description"}
+  {"mode": "shell", "output": …, "pid": claude pid, "description", "command", "owner", "id"}
+
+An agent view prints the subagent's prompt, its text, its tool calls and the start
+of each result as they land in its transcript. It counts as finished once the
+SubagentStop marker is newer than the transcript, or the session's claude process
+is gone; new lines after that put it back to following.
+
+A shell view prints the output file as it grows. It is finished once no process
+has the file open for writing any more.
+
+When finished, the view waits $CLAUDE_HERDR_LINGER seconds (default 120), then
+closes its pane, and herdr drops a tab with its last pane. Keys: q closes now,
+k keeps the pane open until q.
+"""
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+LINGER = int(os.environ.get("CLAUDE_HERDR_LINGER") or 120)
+TICK = 0.3
+RESULT_LINES = 6
+
+BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
+CYAN, GREEN, RED, YELLOW = "\033[36m", "\033[32m", "\033[31m", "\033[33m"
+
+
+def width():
+    return max(20, shutil.get_terminal_size((100, 30)).columns)
+
+
+def cut(s, n):
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
+
+def out(s=""):
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+
+def alive(pid):
+    return bool(pid) and os.path.exists(f"/proc/{pid}")
+
+
+# --- agent transcripts ---------------------------------------------------------
+
+def tool_summary(name, inp):
+    if not isinstance(inp, dict):
+        return ""
+    if name == "Bash":
+        cmd = (inp.get("command") or "").splitlines()
+        return inp.get("description") or (cmd[0] if cmd else "")
+    for k in ("description", "file_path", "path", "pattern", "url", "query", "command", "prompt", "subject"):
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip().splitlines()[0]
+    return ""
+
+
+def result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def user_text(content):
+    """A user message's own text, without the reminders Claude Code adds."""
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return REMINDER.sub("", content).strip() if isinstance(content, str) else ""
+
+
+def title(s):
+    sys.stdout.write(f"\033]0;{s}\007")
+
+
+calls = {}       # tool_use id -> (name, summary)
+last_call = [None]
+
+
+def render(entry):
+    t = entry.get("type")
+    msg = entry.get("message") or {}
+    content = msg.get("content")
+    w = width()
+    if t == "user":
+        text = user_text(content)
+        if text:
+            lines = text.splitlines()
+            out(f"{DIM}▶ " + f"\n{DIM}  ".join(cut(l, w - 2) for l in lines[:12]) + RESET)
+            if len(lines) > 12:
+                out(f"{DIM}  … +{len(lines) - 12} lines{RESET}")
+            out()
+        for b in content if isinstance(content, list) else []:
+            if not isinstance(b, dict) or b.get("type") != "tool_result":
+                continue
+            tid = b.get("tool_use_id")
+            if tid != last_call[0] and tid in calls:  # not right after its call: say whose it is
+                name, summ = calls[tid]
+                out(f"{DIM}  ↳ {name} {cut(summ, w - len(name) - 6)}{RESET}")
+            last_call[0] = None
+            text = result_text(b.get("content")).rstrip()
+            lines = text.splitlines() or ["(no output)"]
+            color = RED if b.get("is_error") else DIM
+            for l in lines[:RESULT_LINES]:
+                out(f"{color}  │ {cut(l, w - 4)}{RESET}")
+            if len(lines) > RESULT_LINES:
+                out(f"{DIM}  │ … +{len(lines) - RESULT_LINES} lines{RESET}")
+    elif t == "assistant":
+        for b in content or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and b.get("text", "").strip():
+                last_call[0] = None
+                out(b["text"].strip())
+                out()
+            elif b.get("type") == "tool_use" and b.get("name") == "SubagentHandback":
+                report = str((b.get("input") or {}).get("message") or "").strip()
+                calls[b.get("id")] = ("report", "")
+                last_call[0] = b.get("id")
+                out(f"{GREEN}●{RESET} {BOLD}report{RESET}")
+                out(report)
+                out()
+            elif b.get("type") == "tool_use":
+                name = b.get("name") or "tool"
+                s = tool_summary(name, b.get("input"))
+                calls[b.get("id")] = (name, s)
+                last_call[0] = b.get("id")
+                out(f"{CYAN}●{RESET} {BOLD}{name}{RESET} {cut(s, w - len(name) - 4)}")
+                if name == "Bash":
+                    cmd = ((b.get("input") or {}).get("command") or "").splitlines()
+                    if cmd and cmd[0] != s:
+                        out(f"{DIM}  $ {cut(cmd[0], w - 4)}{RESET}")
+
+
+class AgentView:
+    def __init__(self, spec):
+        self.path, self.done, self.pid = spec["transcript"], spec.get("done"), spec.get("pid")
+        meta = {}
+        try:
+            with open(spec.get("meta") or "") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            pass
+        kind = spec.get("type") or meta.get("agentType") or "agent"
+        desc = spec.get("description") or meta.get("description") or ""
+        title(f"{kind}: {desc}" if desc else kind)
+        out(f"{BOLD}{kind}{RESET}  {desc}")
+        out(f"{DIM}{'─' * min(width(), 80)}{RESET}")
+        self.pos, self.buf = 0, b""
+
+    def pump(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.pos += len(data)
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        for line in lines:
+            try:
+                render(json.loads(line))
+            except (ValueError, AttributeError, TypeError):
+                pass
+        return True
+
+    def finished(self):
+        if self.pid and not alive(self.pid):
+            return True
+        try:
+            return os.path.getmtime(self.done) >= os.path.getmtime(self.path)
+        except (OSError, TypeError):
+            return False
+
+
+# --- shell output --------------------------------------------------------------
+
+def writers(path):
+    """Processes that have the file open for writing."""
+    pids = set()
+    me = os.getpid()
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{d}/fd"):
+                try:
+                    if os.readlink(f"/proc/{d}/fd/{fd}") != path:
+                        continue
+                    with open(f"/proc/{d}/fdinfo/{fd}") as fi:
+                        flags = next(int(l.split()[1], 8) for l in fi if l.startswith("flags:"))
+                    if flags & 3:
+                        pids.add(int(d))
+                except (OSError, StopIteration, ValueError):
+                    pass
+        except OSError:
+            pass
+    return pids
+
+
+class ShellView:
+    def __init__(self, spec):
+        self.path = os.path.realpath(spec["output"])
+        owner, desc, cmd = spec.get("owner") or "main", spec.get("description") or "", spec.get("command") or ""
+        title(f"{owner}: {desc or 'shell'}")
+        out(f"{BOLD}{desc or 'background shell'}{RESET}  {DIM}{owner} · {spec.get('id', '')}{RESET}")
+        for l in cmd.splitlines()[:3]:
+            out(f"{DIM}$ {cut(l, width() - 2)}{RESET}")
+        out(f"{DIM}{'─' * min(width(), 80)}{RESET}")
+        self.pos = 0
+        try:  # a big file: start with its tail
+            size = os.path.getsize(self.path)
+            if size > 64_000:
+                self.pos = size - 64_000
+                out(f"{DIM}… {self.pos} bytes before{RESET}")
+        except OSError:
+            pass
+        self.pids, self.looked = set(), 0.0
+        self.started = time.time()
+
+    def pump(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.pos += len(data)
+        sys.stdout.write(data.decode("utf-8", "replace"))
+        sys.stdout.flush()
+        return True
+
+    def finished(self):
+        now = time.time()
+        if self.pids:
+            self.pids = {p for p in self.pids if alive(p)}
+            return not self.pids
+        if now - self.looked >= 1.0:  # find the writer; it may not have opened the file yet
+            self.looked = now
+            self.pids = writers(self.path)
+            if self.pids:
+                return False
+        return now - self.started > 5
+
+
+# --- main loop -----------------------------------------------------------------
+
+def key(timeout):
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    return os.read(sys.stdin.fileno(), 16).decode(errors="ignore") if r else ""
+
+
+def close_pane():
+    pane = os.environ.get("HERDR_PANE_ID")
+    if pane:
+        subprocess.run(["herdr", "pane", "close", pane], capture_output=True)
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__.strip())
+        return 2
+    try:
+        with open(sys.argv[1]) as f:
+            spec = json.load(f)
+        os.unlink(sys.argv[1])
+    except (OSError, ValueError) as e:
+        print(f"claude-herdr-view: {e}")
+        return 1
+    sys.stdout.write("\033[H\033[2J")
+    view = AgentView(spec) if spec.get("mode") == "agent" else ShellView(spec)
+
+    tty_ok = sys.stdin.isatty()
+    saved = termios.tcgetattr(sys.stdin) if tty_ok else None
+    if tty_ok:
+        tty.setcbreak(sys.stdin.fileno())
+    try:
+        while True:
+            view.pump()
+            k = key(TICK) if tty_ok else (time.sleep(TICK) or "")
+            if "q" in k:
+                return 0
+            if not view.finished():
+                continue
+            view.pump()
+            out(f"\n{GREEN}── finished{RESET}{DIM} · closes in {LINGER} s · q close now · k keep{RESET}")
+            end, keep = time.time() + LINGER, False
+            while keep or time.time() < end:
+                k = key(TICK) if tty_ok else (time.sleep(TICK) or "")
+                if "q" in k:
+                    return 0
+                if "k" in k and not keep:
+                    keep = True
+                    out(f"{YELLOW}kept open · q closes{RESET}")
+                if view.pump() and not view.finished():
+                    out(f"{YELLOW}── working again{RESET}")
+                    break
+            else:
+                return 0
+    finally:
+        if tty_ok:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+        close_pane()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        close_pane()
+        sys.exit(0)
