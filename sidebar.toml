@@ -15,3 +15,13 @@ claude = [
   ["$sa5"], [{ token = "$sa5do", dim = true }],
   [{ token = "$sa_more", dim = true }],
 ]
+
+# Each space with where its folder lies (token $path from claude-herdr-subagents),
+# otherwise herdr's default space rows. Paths need a little more room than the
+# default sidebar width of 26: set sidebar_width = 32 under [ui].
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  [{ token = "$path", dim = true }],
+  ["branch", "git_status"],
+]

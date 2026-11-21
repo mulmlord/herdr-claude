@@ -43,9 +43,9 @@ it; any other directory is a project of its own.
 | `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes. `claude-herdr-move` alone lists them. |
 | `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: a starting subagent gets a new tab in the session's space, named after its task; a background shell gets a pane beside the work of the agent that started it (beside the main Claude pane for the session itself), further shells stacking below. Nothing takes the focus. Returns at once outside herdr (~10 ms per Bash call). |
 | `claude-herdr-view` | Runs in those panes: follows a subagent's transcript (prompt, text, tool calls with the start of each result, its final report) or a shell's output file. When the work ends it closes its pane after `$CLAUDE_HERDR_LINGER` s (default 120; `q` closes now, `k` keeps it), and a tab goes with its last pane. |
-| `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. It also names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
+| `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. It also puts each space's folder under its name in the sidebar (`$path`, e.g. `~/Projects/herdr-claude`), and names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
-| `sidebar.toml` | The sidebar layout that renders the tokens |
+| `sidebar.toml` | The sidebar layouts that render the tokens (Claude agent rows, space paths) |
 
 ## Requirements
 
@@ -84,12 +84,17 @@ o.bind("SUPER + ALT + H", "Claude Code (herdr)", "claude-herdr")
 o.rebind("SUPER + CTRL + RETURN", "Herdr (project space)", "herdr-here")
 ```
 
-And so that a plain `herdr` typed in a project opens on its space, in `~/.bashrc`:
+And so that a plain `herdr` typed in a project opens on its space, in `~/.bashrc`. Inside herdr, where a nested herdr is refused, it switches the running herdr to that space instead:
 
 ```bash
 herdr() {
-  if (($# == 0)) && [[ -z ${HERDR_ENV:-} ]] && command -v herdr-project-space > /dev/null; then
-    herdr-project-space --focus "$PWD" > /dev/null
+  if (($# == 0)) && command -v herdr-project-space > /dev/null; then
+    local ws
+    ws=$(herdr-project-space --focus "$PWD")
+    if [[ -n ${HERDR_ENV:-} ]]; then
+      [[ -n $ws ]] || echo "herdr: no project space for $PWD" >&2
+      return
+    fi
   fi
   command herdr "$@"
 }

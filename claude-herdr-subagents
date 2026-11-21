@@ -19,7 +19,9 @@ unreported tokens, and rows left without tokens, so nothing shows while a
 session has no subagents. Every report carries a TTL and is renewed while
 unchanged, so the rows also go away if this watcher stops.
 
-It also names herdr's tabs instead of leaving them numbered: after the Claude
+It also shows where each space's folder lies (token $path, rendered under the
+space's name by [ui.sidebar.spaces] in the herdr config), and names herdr's tabs
+instead of leaving them numbered: after the Claude
 session's title for a tab with Claude in it, else after its directory (see
 name_tabs below).
 
@@ -51,6 +53,7 @@ ROWS = 5          # subagents with rows of their own; the rest are "+N more"
 TTL_MS = 30_000   # tokens vanish this long after the last report
 REFRESH = 10      # s; renew the TTL of unchanged tokens this often
 PAD = "\u2800"  # braille blank: looks like a space, but herdr does not trim it
+PROJECTS = os.path.realpath(os.environ.get("CLAUDE_HERDR_PROJECTS") or f"{HOME}/Projects")
 TAB_MAX = 24      # tab names are cut to this many characters
 NAMED = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "claude-herdr", "tab-names.json")
 TOKENS = ["subs", "sa_more"] + [f"sa{i}{s}" for i in range(1, ROWS + 1) for s in ("", "do")]
@@ -213,11 +216,10 @@ def load_named():
         return {}
 
 
-def name_tabs(sock_path, named):
+def name_tabs(sock_path, panes, named):
     """Rename this server's auto-named tabs; `named` maps tab ids to the names given."""
     tabs = (call(sock_path, "tab.list", {}) or {}).get("tabs")
-    panes = (call(sock_path, "pane.list", {}) or {}).get("panes")
-    if tabs is None or panes is None:
+    if tabs is None:
         return False
     by_tab = {}
     for p in panes:
@@ -239,18 +241,66 @@ def name_tabs(sock_path, named):
     return changed or bool(gone)
 
 
+# --- space paths ---------------------------------------------------------------
+# Each space shows where its folder lies, as the token $path under its name. The
+# folder is the project directory (as herdr-project-space defines it) of the
+# space's pane whose project is named like the space, else of its first pane.
+
+def project_dir(d):
+    d = d.rstrip("/") or "/"
+    if d.startswith(PROJECTS + "/"):
+        return os.path.join(PROJECTS, d[len(PROJECTS) + 1:].split("/", 1)[0])
+    return d
+
+
+def tilde(d):
+    return "~" + d[len(HOME):] if d == HOME or d.startswith(HOME + "/") else d
+
+
+def space_paths(sock_path, panes, shown):
+    """Report each space's folder as $path; `shown` maps workspace ids to (path, when reported)."""
+    spaces = (call(sock_path, "workspace.list", {}) or {}).get("workspaces")
+    if spaces is None:
+        return
+    by_ws = {}
+    for p in panes:
+        d = p.get("cwd") or p.get("foreground_cwd")
+        if d:
+            by_ws.setdefault(p.get("workspace_id"), []).append(project_dir(d))
+    now = time.time()
+    for w in spaces:
+        wid, dirs = w.get("workspace_id"), by_ws.get(w.get("workspace_id")) or []
+        if not dirs:
+            continue
+        named = [d for d in dirs if os.path.basename(d) == w.get("label")]
+        path = tilde((named or dirs)[0])
+        old = shown.get(wid)
+        if old and old[0] == path and now - old[1] < REFRESH:
+            continue
+        if call(sock_path, "workspace.report_metadata",
+                {"workspace_id": wid, "source": SOURCE, "tokens": {"path": path}, "ttl_ms": TTL_MS}) is not None:
+            shown[wid] = (path, now)
+    for wid in set(shown) - {w.get("workspace_id") for w in spaces}:
+        del shown[wid]
+
+
 def main():
     once = "--once" in sys.argv[1:]
     sent = {}     # (socket, pane) -> tokens last accepted
     renewed = {}  # (socket, pane) -> when the full set was last sent
     named = load_named()  # socket -> {tab id: name given}
+    shown = {}            # socket -> {workspace id: (path, when reported)}
     while True:
         now = time.time()
         want = {}
         live = herdr_sessions()
         dirty = False
         for sock_path in {DEFAULT_SOCKET} | {where[0] for where in live.values()}:
-            dirty |= name_tabs(sock_path, named.setdefault(sock_path, {}))
+            panes = (call(sock_path, "pane.list", {}) or {}).get("panes")
+            if panes is None:
+                continue
+            dirty |= name_tabs(sock_path, panes, named.setdefault(sock_path, {}))
+            space_paths(sock_path, panes, shown.setdefault(sock_path, {}))
         if dirty and not once:
             os.makedirs(os.path.dirname(NAMED), exist_ok=True)
             with open(NAMED + ".tmp", "w") as f:
