@@ -19,8 +19,13 @@ unreported tokens, and rows left without tokens, so nothing shows while a
 session has no subagents. Every report carries a TTL and is renewed while
 unchanged, so the rows also go away if this watcher stops.
 
-Idle cost is a glance at ~/.claude/sessions: sessions.sh only runs while some
-Claude process lives in a herdr pane (HERDR_PANE_ID in its environment).
+It also names herdr's tabs instead of leaving them numbered: after the Claude
+session's title for a tab with Claude in it, else after its directory (see
+name_tabs below).
+
+Idle cost is a glance at ~/.claude/sessions plus two requests to herdr per poll:
+sessions.sh only runs while some Claude process lives in a herdr pane
+(HERDR_PANE_ID in its environment).
 
 Usage: claude-herdr-subagents [--once]   (--once: one pass, print what it sends)
 """
@@ -37,6 +42,8 @@ CONFIG = os.environ.get("CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
 SESSIONS_DIR = f"{CONFIG}/sessions"
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config"
 SESSIONS_SH = f"{XDG_CONFIG}/omarchy/plugins/mulm.claude-sessions/sessions.sh"
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or f"{HOME}/.cache", "mulm.claude-sessions")
+CACHE_FRESH_MS = 4000  # a live.json this fresh is used as is
 DEFAULT_SOCKET = f"{XDG_CONFIG}/herdr/herdr.sock"
 SOURCE = "user:claude-subagents"
 POLL = 1.5        # s; sessions.sh shares a result for 1.5 s with the bar widgets
@@ -44,6 +51,8 @@ ROWS = 5          # subagents with rows of their own; the rest are "+N more"
 TTL_MS = 30_000   # tokens vanish this long after the last report
 REFRESH = 10      # s; renew the TTL of unchanged tokens this often
 PAD = "\u2800"  # braille blank: looks like a space, but herdr does not trim it
+TAB_MAX = 24      # tab names are cut to this many characters
+NAMED = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "claude-herdr", "tab-names.json")
 TOKENS = ["subs", "sa_more"] + [f"sa{i}{s}" for i in range(1, ROWS + 1) for s in ("", "do")]
 
 
@@ -96,6 +105,19 @@ def herdr_sessions():
 
 
 def widget_sessions():
+    """sessions.sh's result. The bar widget runs it every couple of seconds and leaves it in
+    live.json (time in live.stamp), so a fresh copy is read from there; sessions.sh itself
+    only runs when the bar doesn't (its recomputes on growing transcripts are the costly part)."""
+    try:
+        with open(f"{CACHE}/live.stamp") as f:
+            at = int(f.read().strip())
+        if time.time() * 1000 - at < CACHE_FRESH_MS:
+            with open(f"{CACHE}/live.json") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except (OSError, ValueError):
+        pass
     try:
         r = subprocess.run([SESSIONS_SH], capture_output=True, text=True, timeout=15, cwd=HOME)
         data = json.loads(r.stdout)
@@ -137,10 +159,9 @@ def tokens_for(s, now):
     return t
 
 
-def report(sock_path, pane, tokens):
-    req = {"id": f"{SOURCE}:{time.time_ns()}", "method": "pane.report_metadata",
-           "params": {"pane_id": pane, "source": SOURCE, "agent": "claude", "tokens": tokens,
-                      "ttl_ms": TTL_MS, "seq": time.time_ns()}}
+def call(sock_path, method, params):
+    """One request on herdr's socket: the result, or None (logged when herdr says why)."""
+    req = {"id": f"{SOURCE}:{time.time_ns()}", "method": method, "params": params}
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
             c.settimeout(1.0)
@@ -154,21 +175,87 @@ def report(sock_path, pane, tokens):
                 buf += chunk
         resp = json.loads(buf.split(b"\n", 1)[0] or b"{}")
     except (OSError, ValueError):
-        return False
+        return None
     if resp.get("error"):
-        log(f"{pane}: {resp['error']}")
+        log(f"{method} {params.get('pane_id') or params.get('tab_id') or ''}: {resp['error']}")
+        return None
+    return resp.get("result") or {}
+
+
+def report(sock_path, pane, tokens):
+    return call(sock_path, "pane.report_metadata",
+                {"pane_id": pane, "source": SOURCE, "agent": "claude", "tokens": tokens,
+                 "ttl_ms": TTL_MS, "seq": time.time_ns()}) is not None
+
+
+# --- tab names -----------------------------------------------------------------
+# herdr numbers tabs it isn't told a name for. A tab with Claude in it is named
+# after the Claude session's title (what Claude writes as its terminal title), any
+# other after the directory of its first pane, like tmux's automatic-rename. Only
+# tabs still carrying their number, or the name this watcher gave them, are renamed:
+# a name set by hand stays.
+
+def tab_name(panes):
+    claude = [p for p in panes if p.get("agent") == "claude"]
+    if claude:
+        name = (claude[0].get("terminal_title_stripped") or "").strip() or "claude"
+    else:
+        d = (panes[0].get("foreground_cwd") or panes[0].get("cwd") or "").rstrip("/")
+        name = "~" if d == HOME else os.path.basename(d) or d
+    return name if len(name) <= TAB_MAX else name[: TAB_MAX - 1] + "…"
+
+
+def load_named():
+    try:
+        with open(NAMED) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def name_tabs(sock_path, named):
+    """Rename this server's auto-named tabs; `named` maps tab ids to the names given."""
+    tabs = (call(sock_path, "tab.list", {}) or {}).get("tabs")
+    panes = (call(sock_path, "pane.list", {}) or {}).get("panes")
+    if tabs is None or panes is None:
         return False
-    return True
+    by_tab = {}
+    for p in panes:
+        by_tab.setdefault(p.get("tab_id"), []).append(p)
+    changed = False
+    for t in tabs:
+        tid, label = t.get("tab_id"), str(t.get("label") or "")
+        if label != named.get(tid) and not label.isdigit():
+            if named.pop(tid, None) is not None:  # renamed by hand since
+                changed = True
+            continue
+        want = tab_name(by_tab.get(tid) or [{}])
+        if want and want != label and call(sock_path, "tab.rename", {"tab_id": tid, "label": want}) is not None:
+            named[tid] = want
+            changed = True
+    gone = set(named) - {t.get("tab_id") for t in tabs}
+    for tid in gone:
+        del named[tid]
+    return changed or bool(gone)
 
 
 def main():
     once = "--once" in sys.argv[1:]
     sent = {}     # (socket, pane) -> tokens last accepted
     renewed = {}  # (socket, pane) -> when the full set was last sent
+    named = load_named()  # socket -> {tab id: name given}
     while True:
         now = time.time()
         want = {}
         live = herdr_sessions()
+        dirty = False
+        for sock_path in {DEFAULT_SOCKET} | {where[0] for where in live.values()}:
+            dirty |= name_tabs(sock_path, named.setdefault(sock_path, {}))
+        if dirty and not once:
+            os.makedirs(os.path.dirname(NAMED), exist_ok=True)
+            with open(NAMED + ".tmp", "w") as f:
+                json.dump(named, f)
+            os.replace(NAMED + ".tmp", NAMED)
         if live:
             for where in live.values():
                 want.setdefault(where, {})
