@@ -50,7 +50,7 @@ herdr integration install claude   # herdr resumes Claude sessions after a resta
 Bind `claude-herdr` to a key, e.g. in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + ALT + C", "Claude Code (herdr)", "claude-herdr")
+o.bind("SUPER + ALT + H", "Claude Code (herdr)", "claude-herdr")
 ```
 
 ## Notes
