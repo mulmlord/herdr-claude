@@ -1,0 +1,17 @@
+
+# Claude's default rows, plus the running subagents of the session, which
+# claude-herdr-subagents reports as pane tokens: "3 agents · 1 shell" after the
+# agent name, then per subagent its task and, dimmed, what it is doing.
+# Unreported tokens and rows left without tokens disappear.
+[ui.sidebar.agents.rows_by_agent]
+claude = [
+  ["state_icon", "machine", "workspace", "tab"],
+  ["terminal_title_stripped"],
+  ["agent", { token = "$subs", dim = true }],
+  ["$sa1"], [{ token = "$sa1do", dim = true }],
+  ["$sa2"], [{ token = "$sa2do", dim = true }],
+  ["$sa3"], [{ token = "$sa3do", dim = true }],
+  ["$sa4"], [{ token = "$sa4do", dim = true }],
+  ["$sa5"], [{ token = "$sa5do", dim = true }],
+  [{ token = "$sa_more", dim = true }],
+]

@@ -1,0 +1,210 @@
+#!/usr/bin/python3 -I
+"""claude-herdr-subagents: show Claude Code's subagents in herdr's sidebar.
+
+Claude Code runs its subagents (Agent tool, forks, workflow agents) inside the
+session's own process, so herdr only ever sees one agent per pane. This watcher
+fills in the rest: for every Claude session running in a herdr pane it reports
+that session's running subagents as display-only pane metadata tokens, which
+the Claude sidebar layout in ~/.config/herdr/config.toml
+([ui.sidebar.agents.rows_by_agent] claude) shows under the session's entry:
+
+  $subs             "3 agents · 1 shell" after the agent name
+  $sa1 … $sa5       "├ <description>", one row per subagent, indented by depth
+  $sa1do … $sa5do   "│  4m · <tool> <detail>", how long it runs and what it does now
+  $sa_more          "└ +2 more"
+
+The list comes from the claude-sessions bar widget's sessions.sh, which reads
+running subagents and background shells from the transcripts. Herdr drops
+unreported tokens, and rows left without tokens, so nothing shows while a
+session has no subagents. Every report carries a TTL and is renewed while
+unchanged, so the rows also go away if this watcher stops.
+
+Idle cost is a glance at ~/.claude/sessions: sessions.sh only runs while some
+Claude process lives in a herdr pane (HERDR_PANE_ID in its environment).
+
+Usage: claude-herdr-subagents [--once]   (--once: one pass, print what it sends)
+"""
+import glob
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
+SESSIONS_DIR = f"{CONFIG}/sessions"
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config"
+SESSIONS_SH = f"{XDG_CONFIG}/omarchy/plugins/mulm.claude-sessions/sessions.sh"
+DEFAULT_SOCKET = f"{XDG_CONFIG}/herdr/herdr.sock"
+SOURCE = "user:claude-subagents"
+POLL = 1.5        # s; sessions.sh shares a result for 1.5 s with the bar widgets
+ROWS = 5          # subagents with rows of their own; the rest are "+N more"
+TTL_MS = 30_000   # tokens vanish this long after the last report
+REFRESH = 10      # s; renew the TTL of unchanged tokens this often
+PAD = "\u2800"  # braille blank: looks like a space, but herdr does not trim it
+TOKENS = ["subs", "sa_more"] + [f"sa{i}{s}" for i in range(1, ROWS + 1) for s in ("", "do")]
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def proc_start(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+_env = {}  # (pid, start) -> (socket, pane) or None
+
+
+def herdr_pane(pid):
+    start = proc_start(pid)
+    if start is None:
+        return None
+    key = (pid, start)
+    if key not in _env:
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = dict(v.split(b"=", 1) for v in f.read().split(b"\0") if b"=" in v)
+        except OSError:
+            return None
+        pane = env.get(b"HERDR_PANE_ID")
+        sock = env.get(b"HERDR_SOCKET_PATH")
+        _env[key] = (sock.decode() if sock else DEFAULT_SOCKET, pane.decode()) if pane else None
+        if len(_env) > 512:
+            _env.clear()
+    return _env[key]
+
+
+def herdr_sessions():
+    """pid -> (socket, pane) for every live Claude process in a herdr pane."""
+    out = {}
+    for path in glob.glob(f"{SESSIONS_DIR}/*.json"):
+        try:
+            pid = int(os.path.basename(path)[:-5])
+        except ValueError:
+            continue
+        where = herdr_pane(pid)
+        if where:
+            out[pid] = where
+    return out
+
+
+def widget_sessions():
+    try:
+        r = subprocess.run([SESSIONS_SH], capture_output=True, text=True, timeout=15, cwd=HOME)
+        data = json.loads(r.stdout)
+        return data if isinstance(data, list) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def age(ms, now):
+    if not isinstance(ms, (int, float)):
+        return ""
+    m = int(max(0, now * 1000 - ms) // 60000)
+    return "<1m" if m < 1 else f"{m}m" if m < 60 else f"{m // 60}h{m % 60:02d}"
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def tokens_for(s, now):
+    agents = [a for a in s.get("agents") or [] if isinstance(a, dict)]
+    shells = s.get("shells") or []
+    t = {}
+    parts = ([plural(len(agents), "agent")] if agents else []) + ([plural(len(shells), "shell")] if shells else [])
+    if parts:
+        t["subs"] = " · ".join(parts)
+    shown, more = agents[:ROWS], max(0, len(agents) - ROWS)
+    for i, a in enumerate(shown, 1):
+        last = i == len(shown) and not more
+        # herdr trims leading whitespace (no-break spaces too) from token values
+        indent = PAD * 2 * max(0, (a.get("depth") or 1) - 1)
+        t[f"sa{i}"] = f"{indent}{'└' if last else '├'} {a.get('description') or a.get('type') or 'agent'}"
+        act = a.get("action") or {}
+        doing = " ".join(str(x) for x in (act.get("tool"), act.get("detail")) if x) or "starting"
+        when = age(a.get("startedAt"), now)
+        t[f"sa{i}do"] = f"{indent}{PAD if last else '│'}{PAD * 2}{when + ' · ' if when else ''}{doing}"
+    if more:
+        t["sa_more"] = f"└ +{more} more"
+    return t
+
+
+def report(sock_path, pane, tokens):
+    req = {"id": f"{SOURCE}:{time.time_ns()}", "method": "pane.report_metadata",
+           "params": {"pane_id": pane, "source": SOURCE, "agent": "claude", "tokens": tokens,
+                      "ttl_ms": TTL_MS, "seq": time.time_ns()}}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(1.0)
+            c.connect(sock_path)
+            c.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        resp = json.loads(buf.split(b"\n", 1)[0] or b"{}")
+    except (OSError, ValueError):
+        return False
+    if resp.get("error"):
+        log(f"{pane}: {resp['error']}")
+        return False
+    return True
+
+
+def main():
+    once = "--once" in sys.argv[1:]
+    sent = {}     # (socket, pane) -> tokens last accepted
+    renewed = {}  # (socket, pane) -> when the full set was last sent
+    while True:
+        now = time.time()
+        want = {}
+        live = herdr_sessions()
+        if live:
+            for where in live.values():
+                want.setdefault(where, {})
+            for s in widget_sessions() or []:
+                where = live.get(s.get("pid"))
+                if where:
+                    want[where] = tokens_for(s, now)
+        for key in set(sent) | set(want):
+            new, old = want.get(key, {}), sent.get(key, {})
+            if new and now - renewed.get(key, 0) >= REFRESH:
+                patch = dict(new)  # renew every TTL
+            else:
+                patch = {k: v for k, v in new.items() if old.get(k) != v}
+            patch.update({k: None for k in TOKENS if k in old and k not in new})
+            if not patch:
+                continue
+            if once:
+                print(json.dumps({"pane": key[1], "tokens": patch}, ensure_ascii=False))
+            if report(*key, patch):
+                if new:
+                    sent[key] = new
+                    if patch.keys() >= new.keys():
+                        renewed[key] = now
+                else:
+                    sent.pop(key, None)
+                    renewed.pop(key, None)
+            elif key not in want:
+                sent.pop(key, None)  # pane or server gone; the TTL clears the rest
+                renewed.pop(key, None)
+        if once:
+            return 0
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
