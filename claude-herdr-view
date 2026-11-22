@@ -6,9 +6,9 @@ Started with a JSON spec file (deleted once read). Modes:
   agent   a subagent's tile: a header bar in the agent's family color with its index
           (shape and code), its task, whom it reports to, how long it runs and what it
           does; below, its prompt, text, tool calls with the start of each result and
-          its final report, as they land in its transcript. Finished once the
-          SubagentStop marker is newer than the transcript, or the session's claude
-          process is gone; new lines after that put it back to work.
+          its final report, as they land in its transcript. Finished once its
+          SubagentStop marker is there and the transcript has been quiet for 2 s, or the
+          session's claude process is gone; the marker goes when the agent wakes again.
           {"mode": "agent", "transcript", "meta", "done", "pid", "type", "description",
            "code", "shape", "color", "boss": {"code", "shape", "color"}, "started"}
   shell   a background shell's tile: header in its owner's color, the output file as it
@@ -361,8 +361,10 @@ class AgentTile(Tile):
     def finished(self):
         if self.pid and not alive(self.pid):
             return True
+        # Stopped (the watcher drops the marker again when the agent wakes up), and its
+        # last lines are in: Claude Code may still write a line just after the stop.
         try:
-            return os.path.getmtime(self.done) >= os.path.getmtime(self.path)
+            return os.path.exists(self.done) and time.time() - os.path.getmtime(self.path) > 2
         except (OSError, TypeError):
             return False
 

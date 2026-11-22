@@ -142,6 +142,7 @@ class Session:
                 self.d.update(json.load(f))
         except (OSError, ValueError):
             pass
+        self.d["idle_since"] = time.time()  # a restart doesn't count as idle time
         self.roster_json = None
 
     def save(self):
@@ -241,14 +242,13 @@ class Session:
                 "type": inp.get("agent_type") or meta.get("agentType") or "agent",
                 "description": meta.get("description") or "", "fork": bool(meta.get("isFork")),
                 "transcript": at, "started": time.time(), "tile": None, "done": None}
-        elif a.get("tile") in alive:
-            a["done"] = None  # woke up again; its view goes on
-            return True
-        a["done"] = None
+        a["done"] = None  # (again) at work
         try:
             os.unlink(os.path.join(self.dir, "done", aid))
         except OSError:
             pass
+        if a.get("tile") in alive:
+            return True  # woke up again; its view goes on
         pane = self.place_agent(a, alive)
         if pane:
             a["tile"] = pane
