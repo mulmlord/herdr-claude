@@ -45,10 +45,18 @@ owner's tile (the main pane's for the session's own shells). A tile that would g
 6 rows x 30 columns isn't made; that agent or shell is in the roster only (`◌`).
 
 Each tile has a header bar in its family color: index, task, whom it reports to (`↖ ● A`), run
-time and current action; its name also sits on herdr's split border. When the work ends the bar
-turns grey and the tile closes a minute later (`q` closes now, `k` keeps it, arrows and PgUp/PgDn
-scroll back; herdr's prefix+z zooms a tile). The roster closes once nothing has run for a minute,
-and the main pane gets the whole tab back. New tabs open only for new sessions.
+time and current action; its name also sits on herdr's split border. A tile is only a view:
+closing it (`q` in the tile) leaves the agent working, the roster lists it as `◌ hidden`, and it
+stays closed when the agent wakes up again until you open it. When an agent's work ends its bar
+turns grey and the tile closes a minute later (`k` keeps it); a shell's tile closes as soon as
+the shell exits. Arrows and PgUp/PgDn scroll back, herdr's prefix+z zooms a tile. The roster
+closes once nothing has run for a minute, and the main pane gets the whole tab back. New tabs
+open only for new sessions.
+
+The roster is interactive: ↑ ↓ (or j k, or the mouse wheel) select a row, Enter, space or a click
+opens or closes its tile, `a` opens every hidden one, `h` hides them all. `prefix+a` brings the
+same list up as a popup over the current tab (`claude-herdr-agents`, bound in the herdr config),
+also when the roster itself is out of sight.
 
 ## Parts
 
@@ -67,6 +75,7 @@ it; any other directory is a project of its own.
 | `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: writes one event file per subagent start/stop and background shell start into `$XDG_RUNTIME_DIR/claude-herdr/events`. Returns at once outside herdr (~10 ms per Bash call). |
 | `herdr_tiles.py` | The tile layout, run by the watcher: assigns codes, colors and shapes, places the tiles, keeps each session's roster (state in `$XDG_RUNTIME_DIR/claude-herdr/sessions/<id>/`). |
 | `claude-herdr-view` | Draws the tiles (agent, shell, roster) and the grind loop tabs: a header bar in the family color over the newest lines of the work. |
+| `claude-herdr-agents` | The roster of the focused tab's Claude session as a popup, for a herdr key: open or close agent and shell tiles without stopping their work. |
 | `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1k…5k` (index), `$sa1…5`, `$sa1do…5do` and `$sa_more`, and runs the tile layout (`herdr_tiles.py`). Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. Grind loops (headless `claude -p` sessions named `<loop>-<n>`, one per iteration, run by a service) get a tab per loop in their project's space: the loop's current session live, beside the journal of the unit driving the loop (`<unit>.service` for sessions running as `<unit>-s<n>.service`); the tab closes once the loop has stopped, and one closed by hand stays closed while that loop runs. It also puts each space's folder under its name in the sidebar (`$path`, e.g. `~/Projects/herdr-claude`; a space named after a folder in the projects root shows that folder), and names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
 | `sidebar.toml` | The sidebar layouts that render the tokens: Claude rows with every subagent's index colored by family, space paths |
@@ -102,7 +111,7 @@ done
 
 ```bash
 for f in claude-herdr claude-herdr-subagents claude-herdr-move claude-herdr-tabs claude-herdr-view \
-         herdr-project-space herdr-open herdr-here herdr-window; do   # herdr_tiles.py stays beside them
+         herdr-project-space herdr-open herdr-here herdr-window claude-herdr-agents; do   # herdr_tiles.py stays beside them
   ln -s "$PWD/$f" ~/.local/bin/
 done
 ln -s "$PWD/claude-herdr-subagents.service" ~/.config/systemd/user/
@@ -124,6 +133,18 @@ Keys, e.g. in `~/.config/hypr/bindings.lua`:
 ```lua
 o.bind("SUPER + ALT + H", "Claude Code (herdr)", "claude-herdr")
 o.rebind("SUPER + CTRL + RETURN", "Herdr (project space)", "herdr-here")
+```
+
+and in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "popup"
+command = "claude-herdr-agents"
+description = "Claude agents: open or close tiles"
+width = "70%"
+height = "60%"
 ```
 
 And so that a plain `herdr` belongs to the main herdr window, in `~/.bashrc`: inside herdr (where a nested herdr is refused) it switches to the folder's space; in a terminal outside, the folder gets a shell in the main window (`herdr-open`), that window comes to the front and the terminal closes, since its shell lives on there (it stays in tmux, over SSH or with jobs running). Only without any herdr window does herdr attach in that terminal:

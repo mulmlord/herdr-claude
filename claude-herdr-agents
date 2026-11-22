@@ -1,0 +1,30 @@
+#!/bin/bash
+# claude-herdr-agents: the roster of the Claude session in the focused herdr tab as a popup
+# (bound to prefix+a in the herdr config): open or close the tiles of its agents and shells
+# without stopping their work. ↑ ↓ select, Enter opens or closes, a opens every hidden one,
+# h hides them all, q or Esc closes the popup.
+set -uo pipefail
+sessions=${XDG_RUNTIME_DIR:-/tmp}/claude-herdr/sessions
+panes=$(herdr pane list) || exit 1
+ws=$(herdr workspace list | jq -r '.result.workspaces[] | select(.focused) | .workspace_id')
+tab=$(jq -r --arg w "$ws" 'first(.result.panes[] | select(.workspace_id == $w and .focused) | .tab_id) // empty' <<< "$panes")
+
+dir=""
+for f in $(ls -t "$sessions"/*/layout.json 2> /dev/null); do  # newest first: after a /clear
+  main=$(jq -r '.main // empty' "$f")
+  t=$(jq -r --arg p "$main" 'first(.result.panes[] | select(.pane_id == $p) | .tab_id) // empty' <<< "$panes")
+  if [[ -n $t && $t == "$tab" ]]; then
+    dir=$(dirname "$f")
+    break
+  fi
+done
+
+if [[ -z $dir ]]; then
+  printf '\n  No Claude session with agents in this tab.\n\n  (press any key)'
+  read -rsn1
+  exit 0
+fi
+spec=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/claude-herdr/view.XXXXXX.json")
+jq -n --arg r "$dir/roster.json" --argjson p "$(jq '.cpid // 0' "$dir/layout.json")" \
+  '{mode: "roster", roster: $r, pid: $p, popup: true}' > "$spec"
+exec "$(dirname "$(readlink -f "$0")")/claude-herdr-view" "$spec"

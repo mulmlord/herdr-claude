@@ -457,7 +457,7 @@ def main():
         if not once:
             try:
                 tiles.tick(alive_by_sock, {x.get("sessionId"): x for x in sessions if isinstance(x, dict)})
-            except (OSError, subprocess.SubprocessError, ValueError) as e:
+            except Exception as e:  # noqa: BLE001 — a tile bug must not take the sidebar down
                 log(f"tiles: {e!r}")
         if live:
             for where in live.values():

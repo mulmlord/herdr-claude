@@ -12,17 +12,19 @@ Started with a JSON spec file (deleted once read). Modes:
           {"mode": "agent", "transcript", "meta", "done", "pid", "type", "description",
            "code", "shape", "color", "boss": {"code", "shape", "color"}, "started"}
   shell   a background shell's tile: header in its owner's color, the output file as it
-          grows below. Finished once nothing has the file open for writing.
+          grows below. Closes as soon as nothing has the file open for writing.
           {"mode": "shell", "output", "pid", "description", "command", "owner", "id", "color", "shape"}
-  roster  the session's family tree, live, from the roster.json the watcher keeps.
-          {"mode": "roster", "roster", "pid"}
+  roster  the session's family tree, live, from the roster.json the watcher keeps; rows
+          open and close tiles (see RosterTile). "popup": true for the prefix+a popup.
+          {"mode": "roster", "roster", "pid", "popup"}
   loop    a grind loop: whichever of its headless sessions <group>-<n> runs, then the
           next, streamed; finished once the loop's driver unit has stopped (or, without
           one, after 10 idle minutes), and then it closes its whole tab.
           {"mode": "loop", "group", "unit", "state"}
 
-A finished tile turns its header grey and closes its pane after $CLAUDE_HERDR_LINGER
-seconds (default 60); herdr gives the space back to its neighbors and drops a tab with
+A tile is a view: q closes it and the agent keeps working; the roster opens it again.
+A finished agent's tile turns its header grey and closes its pane after
+$CLAUDE_HERDR_LINGER seconds (default 60), a shell's tile closes when the shell exits; herdr gives the space back to its neighbors and drops a tab with
 its last pane. Keys: q close now, k keep open, ↑ ↓ PgUp PgDn scroll back, G or End to
 the newest.
 """
@@ -319,6 +321,9 @@ class Tile:
         sys.stdout.flush()
         self.dirty = False
 
+    def keys(self, k):
+        self.scroll(k)
+
     def scroll(self, k):
         rows = size()[1] - 1
         step = {"\x1b[A": 1, "\x1b[B": -1, "\x1b[5~": rows - 1, "\x1b[6~": -(rows - 1)}
@@ -456,19 +461,30 @@ class ShellTile(Tile):
 
 
 class RosterTile(Tile):
-    """The family tree of a session's agents and shells, redrawn from roster.json."""
+    """The family tree of a session's agents and shells, redrawn from roster.json. A row
+    opens or closes its tile (the work goes on either way): ↑ ↓ / j k / the wheel select,
+    Enter, space or a click open or close, a opens every hidden one, h hides them all.
+    As the prefix+a popup ("popup": true) q or Esc closes it."""
+
+    MARKS = {"done": "✓", "hidden": "◌", "noroom": "⊘", "none": "◌"}
 
     def __init__(self, spec):
         super().__init__()
-        self.path, self.pid = spec["roster"], spec.get("pid")
+        self.path, self.pid, self.popup = spec["roster"], spec.get("pid"), bool(spec.get("popup"))
+        self.reqdir = os.path.join(os.path.dirname(self.path), "requests")
         self.mtime, self.rows, self.drawn_min = 0, [], -1
-        title("◉ roster")
+        self.sel, self.top = None, 0
+        self.note = ""
+        title("◉ agents" if self.popup else "◉ roster")
+        sys.stdout.write("\033[?1000h\033[?1006h")  # clicks and the wheel reach us
+        sys.stdout.flush()
 
     def header(self, cols):
         n = sum(1 for r in self.rows if r.get("state") == "run" and r.get("shape") != "$")
-        return self.bar(cols, "#3E4451", " ◉ roster", f"{n} agent{'s' * (n != 1)} running ")
+        name = " ◉ agents" if self.popup else " ◉ roster"
+        return self.bar(cols, "#3E4451", name, f"{n} agent{'s' * (n != 1)} running ")
 
-    def pump(self):
+    def load(self):
         try:
             m = os.path.getmtime(self.path)
         except OSError:
@@ -482,25 +498,109 @@ class RosterTile(Tile):
                 self.rows = json.load(f).get("rows") or []
         except (OSError, ValueError):
             return False
-        self.lines, self._wrap = [], (None, 0, [])
+        return True
+
+    def rebuild(self):
+        keys = [r.get("key") for r in self.rows]
+        if self.sel not in keys:
+            self.sel = keys[0] if keys else None
         cols = width()
+        self.lines, self._wrap = [], (None, 0, [])
         for r in self.rows:
+            chosen = r.get("key") == self.sel
             indent = "  " * (r.get("depth", 1) - 1)
             done = r.get("state") != "run"
-            mark = "✓ " if done else ("" if r.get("tile") else "◌ ")
+            if done:
+                mark = "✓ "
+            elif r.get("tile"):
+                mark = "  "
+            else:
+                mark = ("⊘ " if r.get("noroom") else "◌ ")
             idx = f"{r.get('shape')} {r.get('code') if r.get('shape') != '$' else ''}".rstrip()
             text = f" {r.get('description') or ''}{' ⑂' if r.get('fork') else ''}"
-            info = f" · {ago(r.get('started'))}" + (f" · {r['action']}" if r.get("action") and not done else "")
-            line = [("", indent), (DIM, mark), (DIM if done else fg(r.get("color")) + BOLD, idx), (DIM if done else "", text)]
-            line.append((DIM, cut(info, max(0, cols - len(indent) - len(mark) - len(idx) - len(text)))))
+            info = f" · {ago(r.get('started'))}"
+            if r.get("action") and not done:
+                info += f" · {r['action']}"
+            if not done and not r.get("tile"):
+                info += " · no room" if r.get("noroom") else " · hidden"
+            pick = ("▶ " if chosen else "  ")
+            used = len(pick) + len(indent) + len(mark) + len(idx) + len(text)
+            line = [(BOLD if chosen else DIM, pick), ("", indent), (DIM, mark),
+                    (DIM if done else fg(r.get("color")) + BOLD, idx), (DIM if done else "", text),
+                    (DIM, cut(info, max(0, cols - used)))]
+            if chosen:
+                line = [(st + "\033[7m", tx) for st, tx in line[:5]] + line[5:]
             self.lines.append(line)
         if not self.rows:
             self.lines.append([(DIM, " no agents yet")])
+        hint = "↑↓ select · enter open/close · a open all · h hide all" + (" · q close" if self.popup else "")
+        self.lines.append([])
+        self.lines.append([(DIM, cut(self.note or hint, cols))])
         self.dirty = True
-        return True
+
+    def pump(self):
+        if self.load():
+            self.rebuild()
+            return True
+        return False
+
+    def request(self, doc):
+        os.makedirs(self.reqdir, exist_ok=True)
+        path = os.path.join(self.reqdir, f"{time.time_ns()}.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(doc, f)
+        os.replace(path + ".tmp", path)
+
+    def toggle(self):
+        row = next((r for r in self.rows if r.get("key") == self.sel), None)
+        if not row:
+            return
+        self.request({"toggle": row["key"]})
+        what = f"{row.get('shape')} {row.get('code')}"
+        self.note = f"closing {what} (it keeps working)" if row.get("tile") else f"opening {what} …"
+
+    def move(self, n):
+        keys = [r.get("key") for r in self.rows]
+        if not keys:
+            return
+        i = keys.index(self.sel) if self.sel in keys else 0
+        self.sel = keys[max(0, min(len(keys) - 1, i + n))]
+
+    def keys(self, k):
+        if not k:
+            return
+        before = (self.sel, self.note)
+        for b, _x, y, kind in re.findall(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])", k):
+            b, y = int(b), int(y)
+            if b == 64:
+                self.move(-1)
+            elif b == 65:
+                self.move(1)
+            elif b == 0 and kind == "M":
+                body = size()[1] - 1
+                first = max(0, len(self.lines) - body)  # Tile.draw shows the newest lines
+                i = first + y - 2
+                if 0 <= i < len(self.rows):
+                    self.sel = self.rows[i].get("key")
+                    self.toggle()
+        k = re.sub(r"\x1b\[<[\d;]+[Mm]", "", k)
+        if "\x1b[A" in k or "k" in k:
+            self.move(-1)
+        if "\x1b[B" in k or "j" in k:
+            self.move(1)
+        if "\r" in k or "\n" in k or " " in k:
+            self.toggle()
+        if "a" in k:
+            self.request({"open_all": True})
+            self.note = "opening every hidden agent …"
+        if "h" in k:
+            self.request({"hide_all": True})
+            self.note = "hiding every tile (the work goes on)"
+        if (self.sel, self.note) != before:
+            self.rebuild()
 
     def finished(self):
-        return False  # the watcher closes the roster
+        return False  # the watcher closes the roster; the popup closes on q or Esc
 
 
 # --- grind loops (streamed into their own tab) -------------------------------------
@@ -586,7 +686,7 @@ class LoopView:
             out(f"\n{GREEN}── loop stopped{RESET}{DIM} · closes in {left} s · q close now · k keep{RESET}")
             self.said_closing = True
 
-    def scroll(self, k):
+    def keys(self, k):
         pass
 
     def draw(self):
@@ -645,7 +745,9 @@ def main():
         nonlocal last_draw
         view.pump()
         k = key(TICK) if tty_ok else (time.sleep(TICK) or "")
-        view.scroll(k)
+        if k == "\x1b" and spec.get("popup"):
+            k = "q"  # Esc closes the popup
+        view.keys(k)
         now = time.time()
         if tiled and (resized[0] or (view.dirty and now - last_draw > 0.2) or now - last_draw > 15):
             resized[0] = False
@@ -661,7 +763,7 @@ def main():
             if not view.finished():
                 continue
             view.pump()
-            end = time.time() + LINGER
+            end = time.time() + (0 if mode == "shell" else LINGER)  # a shell's tile goes when it exits
             view.keep = False
             while view.keep or time.time() < end:
                 view.closing(int(end - time.time()))
@@ -682,14 +784,15 @@ def main():
         if tty_ok:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
         if tiled:
-            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l")
             sys.stdout.flush()
         if mode == "loop" and natural and spec.get("state"):
             try:  # the loop stopped: a new run of it may get a tab again
                 os.unlink(spec["state"])
             except OSError:
                 pass
-        close_pane(whole_tab=mode == "loop")
+        if not spec.get("popup"):
+            close_pane(whole_tab=mode == "loop")
 
 
 if __name__ == "__main__":

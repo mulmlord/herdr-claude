@@ -19,8 +19,13 @@ watcher calls tick() every poll. Per session:
     agent's code and the one it reports to, its work below. A tile closes itself a
     while after its work ends; the roster goes once nothing has run for ROSTER_IDLE s.
 
+A tile is a view: closing it (q in the tile, or the roster) leaves the work going, and
+the roster (Enter on a row, or the prefix+a popup) opens it again. An agent whose tile
+was closed by hand stays without one when it wakes up again, until it is opened.
+
 State lives in $STATE/sessions/<session id>/: layout.json (codes, tiles), roster.json
-(what the roster tile shows), done/<agent id> (stop markers the views watch).
+(what the roster shows), done/<agent id> (stop markers the views watch), requests/
+(open/close requests from the roster).
 """
 import glob
 import json
@@ -135,6 +140,7 @@ class Session:
         self.sid = sid
         self.dir = os.path.join(SESSIONS, sid)
         os.makedirs(os.path.join(self.dir, "done"), exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "requests"), exist_ok=True)
         self.d = {"main": None, "sock": "", "cpid": 0, "cwd": None, "transcript": None, "roster": None,
                   "agents": {}, "shells": {}, "families": 0, "children": {}, "idle_since": time.time()}
         try:
@@ -241,26 +247,34 @@ class Session:
                 "code": code, "depth": depth, "family": family, "parent": parent and meta.get("parentAgentId"),
                 "type": inp.get("agent_type") or meta.get("agentType") or "agent",
                 "description": meta.get("description") or "", "fork": bool(meta.get("isFork")),
-                "transcript": at, "started": time.time(), "tile": None, "done": None}
+                "transcript": at, "meta": meta_path, "started": time.time(), "tile": None, "done": None,
+                "hidden": False}
         a["done"] = None  # (again) at work
         try:
             os.unlink(os.path.join(self.dir, "done", aid))
         except OSError:
             pass
-        if a.get("tile") in alive:
-            return True  # woke up again; its view goes on
+        if a.get("tile") in alive or a.get("hidden"):
+            return True  # its view goes on, or it was closed by hand and stays so
+        self.open_agent(aid, alive)
+        return True
+
+    def open_agent(self, aid, alive):
+        d, a = self.d, self.d["agents"][aid]
         pane = self.place_agent(a, alive)
-        if pane:
-            a["tile"] = pane
-            alive.add(pane)
-            p = d["agents"].get(a.get("parent") or "")
-            boss = ({"code": p["code"], "shape": shape(p["depth"]), "color": color(p["family"], p["depth"])}
-                    if p else {"code": "main", "shape": MAIN_SHAPE, "color": None})
-            start_view(d["sock"], pane, {
-                "mode": "agent", "transcript": at, "meta": meta_path, "done": os.path.join(self.dir, "done", aid),
-                "pid": d["cpid"], "type": a["type"], "description": a["description"],
-                "code": a["code"], "shape": shape(a["depth"]), "color": color(a["family"], a["depth"]),
-                "boss": boss, "started": a["started"]}, f"{shape(a['depth'])} {a['code']} {a['description']}")
+        if not pane:
+            return False
+        a["tile"], a["hidden"] = pane, False
+        alive.add(pane)
+        p = d["agents"].get(a.get("parent") or "")
+        boss = ({"code": p["code"], "shape": shape(p["depth"]), "color": color(p["family"], p["depth"])}
+                if p else {"code": "main", "shape": MAIN_SHAPE, "color": None})
+        start_view(d["sock"], pane, {
+            "mode": "agent", "transcript": a["transcript"], "meta": a.get("meta"),
+            "done": os.path.join(self.dir, "done", aid), "pid": d["cpid"], "type": a["type"],
+            "description": a["description"], "code": a["code"], "shape": shape(a["depth"]),
+            "color": color(a["family"], a["depth"]), "boss": boss, "started": a["started"]},
+            f"{shape(a['depth'])} {a['code']} {a['description']}")
         return True
 
     def agent_stop(self, ev, alive):
@@ -280,31 +294,92 @@ class Session:
                 or glob.glob(f"/tmp/claude-{os.getuid()}/*/*/tasks/{tid}.output"))
         if not hits:
             return time.time() - ev["_at"] > META_WAIT  # the file shows up a moment later
-        owner = d["agents"].get(inp.get("agent_id") or "")
-        under = owner["tile"] if owner and owner.get("tile") in alive else d["main"]
-        if owner:
-            code, col = owner["code"], color(owner["family"], owner["depth"])
-        else:
-            code, col = "main", None
+        owner_id = inp.get("agent_id") or ""
         ti = inp.get("tool_input") or {}
-        sh = d["shells"][tid] = {"owner": code, "description": ti.get("description") or "",
-                                  "tile": None, "under": under, "started": time.time()}
-        pane = self.place_shell(under, alive)
-        if pane:
-            sh["tile"] = pane
-            alive.add(pane)
-            start_view(d["sock"], pane, {
-                "mode": "shell", "output": hits[0], "pid": d["cpid"], "description": sh["description"],
-                "command": ti.get("command") or "", "owner": code, "id": tid, "color": col,
-                "shape": SHELL_SHAPE}, f"{SHELL_SHAPE} {code}: {sh['description'] or tid}")
+        d["shells"][tid] = {"owner": d["agents"][owner_id]["code"] if owner_id in d["agents"] else "main",
+                            "owner_id": owner_id if owner_id in d["agents"] else None,
+                            "description": ti.get("description") or "", "command": ti.get("command") or "",
+                            "output": hits[0], "tile": None, "under": None, "started": time.time(), "hidden": False}
+        self.open_shell(tid, alive)
         return True
 
+    def open_shell(self, tid, alive):
+        d, sh = self.d, self.d["shells"][tid]
+        owner = d["agents"].get(sh.get("owner_id") or "")
+        under = owner["tile"] if owner and owner.get("tile") in alive else d["main"]
+        pane = self.place_shell(under, alive)
+        if not pane:
+            return False
+        sh["tile"], sh["under"], sh["hidden"] = pane, under, False
+        alive.add(pane)
+        start_view(d["sock"], pane, {
+            "mode": "shell", "output": sh["output"], "pid": d["cpid"], "description": sh["description"],
+            "command": sh["command"], "owner": sh["owner"], "id": tid,
+            "color": color(owner["family"], owner["depth"]) if owner else None, "shape": SHELL_SHAPE},
+            f"{SHELL_SHAPE} {sh['owner']}: {sh['description'] or tid}")
+        return True
+
+    def requests(self, alive):
+        """Open or close tiles as the roster asks (requests/*.json: toggle, open_all, hide_all)."""
+        d = self.d
+        for path in sorted(glob.glob(os.path.join(self.dir, "requests", "*.json"))):
+            try:
+                with open(path) as f:
+                    req = json.load(f)
+            except (OSError, ValueError):
+                req = {}
+            os.unlink(path)
+            keys = []
+            if req.get("toggle"):
+                keys = [req["toggle"]]
+            elif req.get("open_all") or req.get("hide_all"):
+                want_open = bool(req.get("open_all"))
+                keys = [f"agent:{k}" for k, a in d["agents"].items()
+                        if (a.get("tile") in alive) != want_open and (not want_open or not a.get("done"))]
+                keys += [f"shell:{k}" for k, x in d["shells"].items()
+                         if (x.get("tile") in alive) != want_open and (not want_open or self.shell_running(x))]
+            for key in keys:
+                kind, _, ident = key.partition(":")
+                item = (d["agents"] if kind == "agent" else d["shells"]).get(ident)
+                if not item:
+                    continue
+                if item.get("tile") in alive:  # close the view; the work goes on
+                    herdr(d["sock"], "pane", "close", item["tile"])
+                    alive.discard(item["tile"])
+                    item["tile"], item["hidden"] = None, True
+                elif kind == "agent":
+                    if not self.open_agent(ident, alive):
+                        item["noroom"] = time.time()
+                elif not self.open_shell(ident, alive):
+                    item["noroom"] = time.time()
+
+    @staticmethod
+    def shell_running(sh):
+        try:
+            return time.time() - os.path.getmtime(sh["output"]) < 3600
+        except (OSError, KeyError):
+            return False
+
     # roster -----------------------------------------------------------------------
+
+    def shell_row(self, tid, s, col, depth, alive, now):
+        on = s.get("tile") in alive
+        return {"key": f"shell:{tid}", "code": s["owner"], "shape": SHELL_SHAPE, "color": col, "depth": depth,
+                "description": s["description"] or tid, "started": s["started"],
+                "state": "run" if on or (s.get("hidden") and self.shell_running(s)) else "done", "tile": on,
+                "hidden": bool(s.get("hidden")), "noroom": now - s.get("noroom", 0) < 10, "action": ""}
 
     def roster(self, live, alive, now):
         """Write roster.json; close the roster when nothing has run for a while."""
         d = self.d
         running = {a.get("id"): a for a in (live or {}).get("agents", []) if isinstance(a, dict)}
+        for a in d["agents"].values():
+            if a.get("tile") and a["tile"] not in alive:  # its view closed
+                a["hidden"] = a.get("hidden") or not a.get("done")  # before the end: closed by hand
+                a["tile"] = None
+        for x in d["shells"].values():
+            if x.get("tile") and x["tile"] not in alive:
+                x["tile"] = None
         rows = []
 
         def walk(parent, depth):
@@ -320,26 +395,23 @@ class Session:
                     state = "run"
                 else:
                     state = "done"
-                rows.append({"code": a["code"], "shape": shape(a["depth"]), "color": color(a["family"], a["depth"]),
-                             "depth": a["depth"], "description": a["description"] or a["type"],
+                rows.append({"key": f"agent:{aid}", "code": a["code"], "shape": shape(a["depth"]),
+                             "color": color(a["family"], a["depth"]), "depth": a["depth"],
+                             "description": a["description"] or a["type"],
                              "started": (r.get("startedAt") or a["started"] * 1000) / 1000, "state": state,
-                             "tile": a.get("tile") in alive, "fork": a.get("fork"),
+                             "tile": a.get("tile") in alive, "hidden": bool(a.get("hidden")), "fork": a.get("fork"),
+                             "noroom": now - a.get("noroom", 0) < 10,
                              "action": " ".join(str(x) for x in (act.get("tool"), act.get("detail")) if x)})
                 for sid_, s in d["shells"].items():
-                    if s["owner"] == a["code"]:
-                        rows.append({"code": s["owner"], "shape": SHELL_SHAPE, "color": color(a["family"], a["depth"]),
-                                     "depth": a["depth"] + 1, "description": s["description"] or sid_,
-                                     "started": s["started"], "state": "run" if s.get("tile") in alive else "done",
-                                     "tile": s.get("tile") in alive, "action": ""})
+                    if s.get("owner_id") == aid:
+                        rows.append(self.shell_row(sid_, s, color(a["family"], a["depth"]), a["depth"] + 1, alive, now))
                 walk(aid, depth + 1)
 
         walk(None, 1)
         for sid_, s in d["shells"].items():
-            if s["owner"] == "main":
-                rows.append({"code": "main", "shape": SHELL_SHAPE, "color": None, "depth": 1,
-                             "description": s["description"] or sid_, "started": s["started"],
-                             "state": "run" if s.get("tile") in alive else "done", "tile": s.get("tile") in alive,
-                             "action": ""})
+            if not s.get("owner_id"):
+                rows.append(self.shell_row(sid_, s, None, 1, alive, now))
+        reset = False
         busy = any(r["state"] == "run" for r in rows) or any(
             x.get("tile") in alive for x in list(d["agents"].values()) + list(d["shells"].values()))
         if busy:
@@ -348,7 +420,7 @@ class Session:
             herdr(d["sock"], "pane", "close", d["roster"])
             d["roster"] = None
             d["agents"], d["shells"], d["families"], d["children"] = {}, {}, 0, {}
-            return True
+            rows, reset = [], True  # an empty roster for the prefix+a popup
         doc = json.dumps({"rows": rows, "session": d["main"]}, sort_keys=True)
         if doc != self.roster_json:
             self.roster_json = doc
@@ -356,7 +428,7 @@ class Session:
             with open(tmp, "w") as f:
                 f.write(doc)
             os.replace(tmp, os.path.join(self.dir, "roster.json"))
-        return False
+        return reset
 
 
 _sessions = {}
@@ -430,7 +502,14 @@ def tick(alive_by_sock, live_by_sid):
         alive = alive_by_sock.get(s.d["sock"])
         if alive is None or (s.d["main"] not in alive and not s.d["roster"]):
             continue
-        if s.roster(live_by_sid.get(sid), alive, now) or sid in touched:
+        try:  # one session's trouble mustn't stop the others
+            if glob.glob(os.path.join(s.dir, "requests", "*.json")):
+                s.requests(alive)
+                touched.add(sid)
+            if s.roster(live_by_sid.get(sid), alive, now) or sid in touched:
+                s.save()
+        except Exception as e:  # noqa: BLE001
+            log(f"{sid[:8]}: {e!r}")
             s.save()
     return touched
 
