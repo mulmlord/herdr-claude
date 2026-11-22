@@ -1,33 +1,54 @@
 # herdr-claude
 
 Claude Code sessions in [herdr](https://herdr.dev) instead of a terminal window each: one space
-per project, every subagent in a tab of its own with the background shells it starts beside its
-work, and the subagents of each session in herdr's sidebar under the session's entry.
+per project, one tab per session, and inside that tab a tile for every subagent and background
+shell of the session, indexed by color and shape so you can tell who works for whom.
 
 ```
- ● my-project
-   Refactor the auth middleware
-   claude · 3 agents · 1 shell
-   ├ find callers of verify()
-   │  2m · Grep verify\( in src/
-   ├ review session handling
-   │  <1m · Read session.rs
-   └ run the test suite
-      4m · Bash cargo test
+┌─────────────────────────────┬──────────────────────────────────┐
+│                             │ ◉ roster                         │
+│                             │ ● A survey hypr  · 2m · Read …   │
+│   ◉ main Claude session     │   ▲ A1 check binds · <1m · Grep …│
+│                             │ ● B run tests    · 4m · Bash …   │
+│                             ├────────────────┬─────────────────┤
+│                             │▌● A survey hypr│▌▲ A1 check bin… │
+│                             │  ↖ ◉ main      │  ↖ ● A          │
+│                             ├────────────────┴─────────────────┤
+│                             │▌● B run tests   ↖ ◉ main         │
+│                             ├──────────────────────────────────┤
+│                             │▌$ B: cargo test                  │
+└─────────────────────────────┴──────────────────────────────────┘
 ```
 
 Claude Code runs its subagents (Agent tool, forks, workflow agents) inside the session's own
-process, so herdr only ever sees one agent per pane. Hooks and a small watcher fill in the rest:
-a viewer follows each subagent's transcript and each background shell's output file in panes of
-their own, and herdr's pane metadata tokens put the subagents in the sidebar.
+process, so herdr only ever sees one agent per pane. A hook records when subagents and background
+shells start and stop; a watcher lays them out as tiles, and a viewer draws each tile from the
+subagent's transcript or the shell's output file.
 
-```
- tab 1  claude (main session)            │ main: watch the bench
-                                         │ (output of a shell the session started)
- tab 2  find callers of verify()         │ find callers…: cargo test
-        ● Grep verify\( in src/          │ (output of a shell that agent started)
-          │ src/auth.rs:42: verify(…)    │
-```
+### The index
+
+| | means | e.g. |
+|---|---|---|
+| code | place in the family tree: `A`, `B` … for the session's own agents, `A1`, `A2` for their children, then `A1a`, `A1a1` | `A2`: A's second child |
+| color | the family: every agent the session starts gets one of 8 colors (Okabe-Ito, told apart with color blindness); its descendants keep it, a shade lighter per generation | all of A's line in orange |
+| shape | the generation | `●` session agent · `▲` child · `◆` grandchild · `■` deeper · `$` shell · `◉` the session |
+
+The family tree comes from Claude Code itself (`parentAgentId` in each subagent's meta file).
+
+### The layout
+
+The main Claude pane keeps the left part of the session's tab. The right column opens with the
+roster (the whole tree, live: state, run time, current action) and takes a tile per agent:
+session agents stack down the column, a child splits its parent's tile (to the right at odd
+generations, down at even ones), and a background shell takes a strip at the bottom of its
+owner's tile (the main pane's for the session's own shells). A tile that would get smaller than
+6 rows x 30 columns isn't made; that agent or shell is in the roster only (`◌`).
+
+Each tile has a header bar in its family color: index, task, whom it reports to (`↖ ● A`), run
+time and current action; its name also sits on herdr's split border. When the work ends the bar
+turns grey and the tile closes a minute later (`q` closes now, `k` keeps it, arrows and PgUp/PgDn
+scroll back; herdr's prefix+z zooms a tile). The roster closes once nothing has run for a minute,
+and the main pane gets the whole tab back. New tabs open only for new sessions.
 
 ## Parts
 
@@ -43,11 +64,12 @@ it; any other directory is a project of its own.
 | `herdr-here` | `herdr-open` for the focused terminal's folder (for Omarchy's SUPER+CTRL+RETURN); a herdr terminal only opens when no herdr window exists |
 | `claude-herdr` | Opens Claude in its project's space: in the space's only pane when that idles at a shell prompt in the directory (a fresh space), else in a new tab; then brings the herdr window forward, or opens one. `claude-herdr [--prompt TEXT] [--no-focus] [--space SDIR] [DIR] [-- CLAUDE_ARGS...]`; `$HOME` becomes the projects root, and `--space` puts Claude into another project's space while it runs in DIR. |
 | `claude-herdr-move` | Moves Claude sessions from terminal windows into herdr: closes the window and resumes the conversation (`claude --resume`, same model and permission mode) in its project's space. Only sessions with nothing in flight (no turn, question, background shell or subagent) move; `--wait` waits for the others and moves each once it has been idle for 2 minutes; `--space DIR` puts them into DIR's project space. `claude-herdr-move` alone lists them. |
-| `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: a starting subagent gets a new tab in the session's space, named after its task; a background shell gets a pane beside the work of the agent that started it (beside the main Claude pane for the session itself), further shells stacking below. Nothing takes the focus. Returns at once outside herdr (~10 ms per Bash call). |
-| `claude-herdr-view` | Runs in those panes: follows a subagent's transcript (prompt, text, tool calls with the start of each result, its final report) or a shell's output file, or a grind loop (whichever of its sessions runs, then the next). When the work ends it closes its pane after `$CLAUDE_HERDR_LINGER` s (default 120; `q` closes now, `k` keeps it), and a tab goes with its last pane. |
-| `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1…5`, `$sa1do…5do` and `$sa_more`. Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. Grind loops (headless `claude -p` sessions named `<loop>-<n>`, one per iteration, run by a service) get a tab per loop in their project's space: the loop's current session live, beside the journal of the unit driving the loop (`<unit>.service` for sessions running as `<unit>-s<n>.service`); the tab closes once the loop has stopped, and one closed by hand stays closed while that loop runs. It also puts each space's folder under its name in the sidebar (`$path`, e.g. `~/Projects/herdr-claude`; a space named after a folder in the projects root shows that folder), and names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
+| `claude-herdr-tabs` | Claude Code hook (SubagentStart, SubagentStop, PostToolUse on Bash) for sessions in herdr: writes one event file per subagent start/stop and background shell start into `$XDG_RUNTIME_DIR/claude-herdr/events`. Returns at once outside herdr (~10 ms per Bash call). |
+| `herdr_tiles.py` | The tile layout, run by the watcher: assigns codes, colors and shapes, places the tiles, keeps each session's roster (state in `$XDG_RUNTIME_DIR/claude-herdr/sessions/<id>/`). |
+| `claude-herdr-view` | Draws the tiles (agent, shell, roster) and the grind loop tabs: a header bar in the family color over the newest lines of the work. |
+| `claude-herdr-subagents` | Watcher: for each Claude session in a herdr pane it reports the running subagents and background shells as pane tokens `$subs`, `$sa1k…5k` (index), `$sa1…5`, `$sa1do…5do` and `$sa_more`, and runs the tile layout (`herdr_tiles.py`). Tokens carry a 30 s TTL, renewed every 10 s while unchanged, so they vanish if the watcher stops. Grind loops (headless `claude -p` sessions named `<loop>-<n>`, one per iteration, run by a service) get a tab per loop in their project's space: the loop's current session live, beside the journal of the unit driving the loop (`<unit>.service` for sessions running as `<unit>-s<n>.service`); the tab closes once the loop has stopped, and one closed by hand stays closed while that loop runs. It also puts each space's folder under its name in the sidebar (`$path`, e.g. `~/Projects/herdr-claude`; a space named after a folder in the projects root shows that folder), and names tabs instead of leaving them numbered: after the Claude session's title where Claude runs, else after the tab's directory (like tmux's automatic-rename); a tab you rename yourself keeps its name. `--once` does one pass and prints what it sends. It reads the session data the bar widget already computes (`live.json`) while that is fresh, so it costs about 1 ms of CPU per second. |
 | `claude-herdr-subagents.service` | systemd user unit for the watcher |
-| `sidebar.toml` | The sidebar layouts that render the tokens (Claude agent rows, space paths) |
+| `sidebar.toml` | The sidebar layouts that render the tokens: Claude rows with every subagent's index colored by family, space paths |
 
 ## Grind loops
 
@@ -80,7 +102,7 @@ done
 
 ```bash
 for f in claude-herdr claude-herdr-subagents claude-herdr-move claude-herdr-tabs claude-herdr-view \
-         herdr-project-space herdr-open herdr-here herdr-window; do
+         herdr-project-space herdr-open herdr-here herdr-window; do   # herdr_tiles.py stays beside them
   ln -s "$PWD/$f" ~/.local/bin/
 done
 ln -s "$PWD/claude-herdr-subagents.service" ~/.config/systemd/user/
@@ -89,7 +111,7 @@ cat sidebar.toml >> ~/.config/herdr/config.toml && herdr server reload-config
 herdr integration install claude   # herdr resumes Claude sessions after a restart
 ```
 
-Hooks for the agent tabs, in `~/.claude/settings.json` (new sessions pick them up):
+Hooks for the agent tiles, in `~/.claude/settings.json` (new sessions pick them up):
 
 ```json
 "SubagentStart": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/claude-herdr-tabs agent-start", "timeout": 10 }] }],

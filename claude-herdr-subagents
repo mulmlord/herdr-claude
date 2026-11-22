@@ -43,6 +43,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import herdr_tiles as tiles  # noqa: E402
+
 HOME = os.path.expanduser("~")
 CONFIG = os.environ.get("CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
 SESSIONS_DIR = f"{CONFIG}/sessions"
@@ -63,7 +66,7 @@ STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "claude-he
 LOOP_MIN_AGE = 30  # s a headless session runs before its loop gets a tab
 TAB_MAX = 24      # tab names are cut to this many characters
 NAMED = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "claude-herdr", "tab-names.json")
-TOKENS = ["subs", "sa_more"] + [f"sa{i}{s}" for i in range(1, ROWS + 1) for s in ("", "do")]
+TOKENS = ["subs", "sa_more"] + [f"sa{i}{s}" for i in range(1, ROWS + 1) for s in ("k", "", "do")]
 
 
 def log(msg):
@@ -148,24 +151,28 @@ def plural(n, word):
 
 
 def tokens_for(s, now):
+    """Sidebar tokens for a session: per subagent its index (shape and code, colored by
+    family through the [ui.sidebar.agents] rules), its task, and what it does now."""
     agents = [a for a in s.get("agents") or [] if isinstance(a, dict)]
     shells = s.get("shells") or []
+    index = tiles.codes(s.get("sessionId") or "")
     t = {}
     parts = ([plural(len(agents), "agent")] if agents else []) + ([plural(len(shells), "shell")] if shells else [])
     if parts:
         t["subs"] = " · ".join(parts)
     shown, more = agents[:ROWS], max(0, len(agents) - ROWS)
     for i, a in enumerate(shown, 1):
-        last = i == len(shown) and not more
+        code, depth = index.get(a.get("id"), ("·", a.get("depth") or 1))
         # herdr trims leading whitespace (no-break spaces too) from token values
-        indent = PAD * 2 * max(0, (a.get("depth") or 1) - 1)
-        t[f"sa{i}"] = f"{indent}{'└' if last else '├'} {a.get('description') or a.get('type') or 'agent'}"
+        indent = PAD * 2 * max(0, depth - 1)
+        t[f"sa{i}k"] = f"{indent}{code}"
+        t[f"sa{i}"] = a.get("description") or a.get("type") or "agent"
         act = a.get("action") or {}
         doing = " ".join(str(x) for x in (act.get("tool"), act.get("detail")) if x) or "starting"
         when = age(a.get("startedAt"), now)
-        t[f"sa{i}do"] = f"{indent}{PAD if last else '│'}{PAD * 2}{when + ' · ' if when else ''}{doing}"
+        t[f"sa{i}do"] = f"{indent}{PAD * 2}{when + ' · ' if when else ''}{doing}"
     if more:
-        t["sa_more"] = f"└ +{more} more"
+        t["sa_more"] = f"+{more} more"
     return t
 
 
@@ -193,9 +200,13 @@ def call(sock_path, method, params):
 
 
 def report(sock_path, pane, tokens):
-    return call(sock_path, "pane.report_metadata",
-                {"pane_id": pane, "source": SOURCE, "agent": "claude", "tokens": tokens,
-                 "ttl_ms": TTL_MS, "seq": time.time_ns()}) is not None
+    items = list(tokens.items())
+    for i in range(0, len(items), 16):  # herdr takes at most 16 token keys per report
+        if call(sock_path, "pane.report_metadata",
+                {"pane_id": pane, "source": SOURCE, "agent": "claude", "tokens": dict(items[i:i + 16]),
+                 "ttl_ms": TTL_MS, "seq": time.time_ns()}) is None:
+            return False
+    return True
 
 
 # --- tab names -----------------------------------------------------------------
@@ -418,15 +429,18 @@ def main():
     named = load_named()  # socket -> {tab id: name given}
     shown = {}            # socket -> {workspace id: (path, when reported)}
     checked = {}          # loop driver unit -> when its state was last checked
+    tiles.load_all()
     while True:
         now = time.time()
         want = {}
         live = herdr_sessions()
         dirty = False
-        for sock_path in {DEFAULT_SOCKET} | {where[0] for where in live.values()}:
+        alive_by_sock = {}
+        for sock_path in {DEFAULT_SOCKET} | {where[0] for where in live.values()} | tiles.sockets():
             panes = (call(sock_path, "pane.list", {}) or {}).get("panes")
             if panes is None:
                 continue
+            alive_by_sock[sock_path] = {p.get("pane_id") for p in panes}
             dirty |= name_tabs(sock_path, panes, named.setdefault(sock_path, {}))
             space_paths(sock_path, panes, shown.setdefault(sock_path, {}))
             if sock_path == DEFAULT_SOCKET and not once:
@@ -439,10 +453,16 @@ def main():
             with open(NAMED + ".tmp", "w") as f:
                 json.dump(named, f)
             os.replace(NAMED + ".tmp", NAMED)
+        sessions = widget_sessions() or [] if live or tiles.active() else []
+        if not once:
+            try:
+                tiles.tick(alive_by_sock, {x.get("sessionId"): x for x in sessions if isinstance(x, dict)})
+            except (OSError, subprocess.SubprocessError, ValueError) as e:
+                log(f"tiles: {e!r}")
         if live:
             for where in live.values():
                 want.setdefault(where, {})
-            for s in widget_sessions() or []:
+            for s in sessions:
                 where = live.get(s.get("pid"))
                 if where:
                     want[where] = tokens_for(s, now)

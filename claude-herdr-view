@@ -1,50 +1,60 @@
 #!/usr/bin/python3 -I
-"""claude-herdr-view: follow a Claude subagent's work or a background shell's output in a herdr pane.
+"""claude-herdr-view: what runs in the panes herdr-claude opens.
 
-Started by claude-herdr-tabs with a JSON spec file (deleted once read):
-  {"mode": "agent", "transcript": …, "meta": …, "done": marker, "pid": claude pid, "type", "description"}
-  {"mode": "shell", "output": …, "pid": claude pid, "description", "command", "owner", "id"}
+Started with a JSON spec file (deleted once read). Modes:
 
-An agent view prints the subagent's prompt, its text, its tool calls and the start
-of each result as they land in its transcript. It counts as finished once the
-SubagentStop marker is newer than the transcript, or the session's claude process
-is gone; new lines after that put it back to following.
+  agent   a subagent's tile: a header bar in the agent's family color with its index
+          (shape and code), its task, whom it reports to, how long it runs and what it
+          does; below, its prompt, text, tool calls with the start of each result and
+          its final report, as they land in its transcript. Finished once the
+          SubagentStop marker is newer than the transcript, or the session's claude
+          process is gone; new lines after that put it back to work.
+          {"mode": "agent", "transcript", "meta", "done", "pid", "type", "description",
+           "code", "shape", "color", "boss": {"code", "shape", "color"}, "started"}
+  shell   a background shell's tile: header in its owner's color, the output file as it
+          grows below. Finished once nothing has the file open for writing.
+          {"mode": "shell", "output", "pid", "description", "command", "owner", "id", "color", "shape"}
+  roster  the session's family tree, live, from the roster.json the watcher keeps.
+          {"mode": "roster", "roster", "pid"}
+  loop    a grind loop: whichever of its headless sessions <group>-<n> runs, then the
+          next, streamed; finished once the loop's driver unit has stopped (or, without
+          one, after 10 idle minutes), and then it closes its whole tab.
+          {"mode": "loop", "group", "unit", "state"}
 
-A loop view follows a loop of headless sessions named <group>-<n> (grind loops:
-claude -p, one session per iteration, started by a systemd unit): whichever of
-them runs, from its last entries on, then the next. It is finished once the
-loop's driver unit has stopped (or, without one, after 10 idle minutes), and
-closes its whole tab, the unit's journal pane included.
-  {"mode": "loop", "group": …, "unit": driver unit or null, "state": watcher state file}
-
-A shell view prints the output file as it grows. It is finished once no process
-has the file open for writing any more.
-
-When finished, the view waits $CLAUDE_HERDR_LINGER seconds (default 120), then
-closes its pane, and herdr drops a tab with its last pane. Keys: q closes now,
-k keeps the pane open until q.
+A finished tile turns its header grey and closes its pane after $CLAUDE_HERDR_LINGER
+seconds (default 60); herdr gives the space back to its neighbors and drops a tab with
+its last pane. Keys: q close now, k keep open, ↑ ↓ PgUp PgDn scroll back, G or End to
+the newest.
 """
 import json
 import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import termios
 import time
 import tty
 
-LINGER = int(os.environ.get("CLAUDE_HERDR_LINGER") or 120)
-TICK = 0.3
+LINGER = int(os.environ.get("CLAUDE_HERDR_LINGER") or 60)
+TICK = 0.25
 RESULT_LINES = 6
+KEEP_LINES = 3000
 
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
 CYAN, GREEN, RED, YELLOW = "\033[36m", "\033[32m", "\033[31m", "\033[33m"
+GREY_BG = "#5C6370"
+
+
+def size():
+    s = shutil.get_terminal_size((100, 30))
+    return max(20, s.columns), max(4, s.lines)
 
 
 def width():
-    return max(20, shutil.get_terminal_size((100, 30)).columns)
+    return size()[0]
 
 
 def cut(s, n):
@@ -60,7 +70,50 @@ def alive(pid):
     return bool(pid) and os.path.exists(f"/proc/{pid}")
 
 
-# --- agent transcripts ---------------------------------------------------------
+def title(s):
+    sys.stdout.write(f"\033]0;{s}\007")
+
+
+def rgb(hexcolor):
+    h = (hexcolor or "#888888").lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def fg(hexcolor):
+    return "\033[38;2;%d;%d;%dm" % rgb(hexcolor) if hexcolor else ""
+
+
+def bg(hexcolor):
+    return "\033[48;2;%d;%d;%dm" % rgb(hexcolor)
+
+
+def ink(hexcolor):
+    """Black or white text, whichever reads on this background."""
+    r, g, b = rgb(hexcolor)
+    return "\033[38;2;0;0;0m" if 0.299 * r + 0.587 * g + 0.114 * b > 140 else "\033[38;2;255;255;255m"
+
+
+def ago(t):
+    m = int(max(0, time.time() - (t or time.time())) // 60)
+    return "<1m" if m < 1 else f"{m}m" if m < 60 else f"{m // 60}h{m % 60:02d}"
+
+
+# --- transcripts -----------------------------------------------------------------
+# render(entry, emit) hands emit one line at a time, as a list of (style, text).
+
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+NOTICE = re.compile(r"<task-notification>.*?</task-notification>", re.S)
+SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
+
+
+def notice(m):
+    """A task notification as one line: its summary."""
+    s = SUMMARY.search(m.group(0))
+    return "⚑ " + (s.group(1).strip() if s else "task notification")
+calls = {}         # tool_use id -> (name, summary)
+last_call = [None]
+doing = [""]       # the latest tool call, for headers
+
 
 def tool_summary(name, inp):
     if not isinstance(inp, dict):
@@ -83,94 +136,103 @@ def result_text(content):
     return ""
 
 
-REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
-
-
 def user_text(content):
     """A user message's own text, without the reminders Claude Code adds."""
     if isinstance(content, list):
         content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
-    return REMINDER.sub("", content).strip() if isinstance(content, str) else ""
+    return NOTICE.sub(notice, REMINDER.sub("", content)).strip() if isinstance(content, str) else ""
 
 
-def title(s):
-    sys.stdout.write(f"\033]0;{s}\007")
-
-
-calls = {}       # tool_use id -> (name, summary)
-last_call = [None]
-
-
-def render(entry):
+def render(entry, emit):
     t = entry.get("type")
-    msg = entry.get("message") or {}
-    content = msg.get("content")
-    w = width()
+    content = (entry.get("message") or {}).get("content")
     if t == "user":
         text = user_text(content)
         if text:
             lines = text.splitlines()
-            out(f"{DIM}▶ " + f"\n{DIM}  ".join(cut(l, w - 2) for l in lines[:12]) + RESET)
+            for i, l in enumerate(lines[:12]):
+                emit([(YELLOW if l.startswith("⚑") else DIM, l if l.startswith("⚑") else ("▶ " if i == 0 else "  ") + l)])
             if len(lines) > 12:
-                out(f"{DIM}  … +{len(lines) - 12} lines{RESET}")
-            out()
+                emit([(DIM, f"  … +{len(lines) - 12} lines")])
+            emit([])
         for b in content if isinstance(content, list) else []:
             if not isinstance(b, dict) or b.get("type") != "tool_result":
                 continue
             tid = b.get("tool_use_id")
             if tid != last_call[0] and tid in calls:  # not right after its call: say whose it is
                 name, summ = calls[tid]
-                out(f"{DIM}  ↳ {name} {cut(summ, w - len(name) - 6)}{RESET}")
+                emit([(DIM, f"  ↳ {name} {summ}")])
             last_call[0] = None
             text = result_text(b.get("content")).rstrip()
             lines = text.splitlines() or ["(no output)"]
-            color = RED if b.get("is_error") else DIM
+            style = RED if b.get("is_error") else DIM
             for l in lines[:RESULT_LINES]:
-                out(f"{color}  │ {cut(l, w - 4)}{RESET}")
+                emit([(style, "  │ " + l)])
             if len(lines) > RESULT_LINES:
-                out(f"{DIM}  │ … +{len(lines) - RESULT_LINES} lines{RESET}")
+                emit([(DIM, f"  │ … +{len(lines) - RESULT_LINES} lines")])
     elif t == "assistant":
         for b in content or []:
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text" and b.get("text", "").strip():
                 last_call[0] = None
-                out(b["text"].strip())
-                out()
+                for l in b["text"].strip().splitlines():
+                    emit([("", l)])
+                emit([])
             elif b.get("type") == "tool_use" and b.get("name") == "SubagentHandback":
                 report = str((b.get("input") or {}).get("message") or "").strip()
                 calls[b.get("id")] = ("report", "")
                 last_call[0] = b.get("id")
-                out(f"{GREEN}●{RESET} {BOLD}report{RESET}")
-                out(report)
-                out()
+                doing[0] = "reporting"
+                emit([(GREEN, "● "), (BOLD, "report")])
+                for l in report.splitlines():
+                    emit([("", l)])
+                emit([])
             elif b.get("type") == "tool_use":
                 name = b.get("name") or "tool"
                 s = tool_summary(name, b.get("input"))
                 calls[b.get("id")] = (name, s)
                 last_call[0] = b.get("id")
-                out(f"{CYAN}●{RESET} {BOLD}{name}{RESET} {cut(s, w - len(name) - 4)}")
+                doing[0] = f"{name} {s}".strip()
+                emit([(CYAN, "● "), (BOLD, name), ("", " " + s)])
                 if name == "Bash":
                     cmd = ((b.get("input") or {}).get("command") or "").splitlines()
                     if cmd and cmd[0] != s:
-                        out(f"{DIM}  $ {cut(cmd[0], w - 4)}{RESET}")
+                        emit([(DIM, "  $ " + cmd[0])])
 
 
-class AgentView:
-    def __init__(self, spec):
-        self.path, self.done, self.pid = spec["transcript"], spec.get("done"), spec.get("pid")
-        meta = {}
+def emit_stream(segments):
+    out("".join(f"{st}{tx}{RESET if st else ''}" for st, tx in segments))
+
+
+class Follow:
+    """Reads a growing JSONL file and renders its new entries."""
+
+    def __init__(self, path, emit, skip_to=None):
+        self.path, self.emit, self.pos, self.buf = path, emit, 0, b""
+        if skip_to is not None:
+            self.catch_up(skip_to)
+
+    def catch_up(self, keep):
         try:
-            with open(spec.get("meta") or "") as f:
-                meta = json.load(f)
-        except (OSError, ValueError):
-            pass
-        kind = spec.get("type") or meta.get("agentType") or "agent"
-        desc = spec.get("description") or meta.get("description") or ""
-        title(f"{kind}: {desc}" if desc else kind)
-        out(f"{BOLD}{kind}{RESET}  {desc}")
-        out(f"{DIM}{'─' * min(width(), 80)}{RESET}")
-        self.pos, self.buf = 0, b""
+            with open(self.path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return
+        lines = data.split(b"\n")
+        if len(lines) > keep + 1:
+            self.emit([(DIM, f"  … {len(lines) - keep - 1} earlier entries")])
+            lines = lines[-(keep + 1):]
+        *done, self.buf = lines
+        self.pos = len(data)
+        self.feed(done)
+
+    def feed(self, lines):
+        for line in lines:
+            try:
+                render(json.loads(line), self.emit)
+            except (ValueError, AttributeError, TypeError):
+                pass
 
     def pump(self):
         try:
@@ -184,12 +246,117 @@ class AgentView:
         self.pos += len(data)
         self.buf += data
         *lines, self.buf = self.buf.split(b"\n")
-        for line in lines:
-            try:
-                render(json.loads(line))
-            except (ValueError, AttributeError, TypeError):
-                pass
+        self.feed(lines)
         return True
+
+
+# --- tiles -------------------------------------------------------------------------
+
+class Tile:
+    """A pane drawn in place: a header bar on the first row, the newest lines below."""
+
+    def __init__(self):
+        self.lines = []          # each a list of (style, text)
+        self.offset = 0          # rows scrolled back from the newest
+        self.dirty = True
+        self.done_at = None
+        self.keep = False
+        self._wrap = (None, 0, [])
+
+    def emit(self, segments):
+        self.lines.append(segments)
+        if len(self.lines) > KEEP_LINES:
+            del self.lines[: len(self.lines) - KEEP_LINES]
+            self._wrap = (None, 0, [])
+        self.dirty = True
+
+    def wrapped(self, cols):
+        w, n, rows = self._wrap
+        if w != cols or n > len(self.lines):
+            w, n, rows = cols, 0, []
+        for segs in self.lines[n:]:
+            row, used = [], 0
+            if not segs:
+                rows.append([])
+                continue
+            for st, tx in segs:
+                tx = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", tx.replace("\t", "  "))
+                while tx:
+                    room = cols - used
+                    if room <= 0:
+                        rows.append(row)
+                        row, used = [], 0
+                        room = cols
+                    row.append((st, tx[:room]))
+                    used += len(tx[:room])
+                    tx = tx[room:]
+            rows.append(row)
+        self._wrap = (cols, len(self.lines), rows)
+        return rows
+
+    def header(self, cols):
+        return ""
+
+    def bar(self, cols, color, left, right):
+        """A full-width header bar: left text, right text, in `color`."""
+        right = cut(right, max(0, cols - 12))
+        left = cut(left, max(1, cols - len(right) - 1))
+        pad = max(0, cols - len(left) - len(right))
+        return f"{bg(color)}{ink(color)}{BOLD}{left}{RESET}{bg(color)}{ink(color)}{' ' * pad}{right}{RESET}"
+
+    def draw(self):
+        cols, rows = size()
+        body = rows - 1
+        wrapped = self.wrapped(cols)
+        self.offset = max(0, min(self.offset, len(wrapped) - body))
+        end = len(wrapped) - self.offset
+        shown = wrapped[max(0, end - body):end]
+        buf = ["\033[?25l\033[1;1H", self.header(cols)]
+        for i, row in enumerate(shown):
+            buf.append(f"\033[{i + 2};1H" + "".join(f"{st}{tx}{RESET if st else ''}" for st, tx in row) + "\033[K")
+        buf.append(f"\033[{len(shown) + 2};1H\033[J")
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+        self.dirty = False
+
+    def scroll(self, k):
+        rows = size()[1] - 1
+        step = {"\x1b[A": 1, "\x1b[B": -1, "\x1b[5~": rows - 1, "\x1b[6~": -(rows - 1)}
+        for seq, n in step.items():
+            if seq in k:
+                self.offset = max(0, self.offset + n)
+                self.dirty = True
+        if "G" in k or "\x1b[F" in k or "\x1b[4~" in k:
+            self.offset, self.dirty = 0, True
+
+    def closing(self, left):
+        """The header while finished: grey, with the time left."""
+        self.done_at = self.done_at or time.time()
+        self.left = left
+        self.dirty = True
+
+
+class AgentTile(Tile):
+    def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
+        self.path, self.done, self.pid = spec["transcript"], spec.get("done"), spec.get("pid")
+        self.left = None
+        title(f"{spec.get('shape', '●')} {spec.get('code', '')} {spec.get('description', '')}")
+        self.follow = Follow(self.path, self.emit)
+
+    def header(self, cols):
+        s = self.spec
+        boss = s.get("boss") or {}
+        if self.done_at:
+            note = "kept · q closes" if self.keep else f"closes in {self.left}s · k keep · q close"
+            return self.bar(cols, GREY_BG, f" ✓ {s.get('code')} {s.get('description') or ''}", f"done · {note} ")
+        left = f" {s.get('shape')} {s.get('code')}  {s.get('description') or s.get('type') or ''}"
+        right = f"↖ {boss.get('shape', '◉')} {boss.get('code', 'main')} · {ago(s.get('started'))} · {doing[0] or 'starting'} "
+        return self.bar(cols, s.get("color"), left, right)
+
+    def pump(self):
+        return self.follow.pump()
 
     def finished(self):
         if self.pid and not alive(self.pid):
@@ -199,8 +366,6 @@ class AgentView:
         except (OSError, TypeError):
             return False
 
-
-# --- shell output --------------------------------------------------------------
 
 def writers(path):
     """Processes that have the file open for writing."""
@@ -225,25 +390,36 @@ def writers(path):
     return pids
 
 
-class ShellView:
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+
+
+class ShellTile(Tile):
     def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
         self.path = os.path.realpath(spec["output"])
-        owner, desc, cmd = spec.get("owner") or "main", spec.get("description") or "", spec.get("command") or ""
-        title(f"{owner}: {desc or 'shell'}")
-        out(f"{BOLD}{desc or 'background shell'}{RESET}  {DIM}{owner} · {spec.get('id', '')}{RESET}")
-        for l in cmd.splitlines()[:3]:
-            out(f"{DIM}$ {cut(l, width() - 2)}{RESET}")
-        out(f"{DIM}{'─' * min(width(), 80)}{RESET}")
-        self.pos = 0
-        try:  # a big file: start with its tail
-            size = os.path.getsize(self.path)
-            if size > 64_000:
-                self.pos = size - 64_000
-                out(f"{DIM}… {self.pos} bytes before{RESET}")
+        self.left = None
+        title(f"$ {spec.get('owner') or 'main'}: {spec.get('description') or 'shell'}")
+        for l in (spec.get("command") or "").splitlines()[:3]:
+            self.emit([(DIM, "$ " + l)])
+        self.pos, self.part = 0, ""
+        try:
+            size_ = os.path.getsize(self.path)
+            if size_ > 64_000:
+                self.pos = size_ - 64_000
+                self.emit([(DIM, f"… {self.pos} bytes before")])
         except OSError:
             pass
-        self.pids, self.looked = set(), 0.0
-        self.started = time.time()
+        self.pids, self.looked, self.started = set(), 0.0, time.time()
+
+    def header(self, cols):
+        s = self.spec
+        color = s.get("color") or "#7F8C98"
+        if self.done_at:
+            note = "kept · q closes" if self.keep else f"closes in {self.left}s · k keep · q close"
+            return self.bar(cols, GREY_BG, f" ✓ $ {s.get('owner')}: {s.get('description') or ''}", f"ended · {note} ")
+        return self.bar(cols, color, f" $ {s.get('owner')}: {s.get('description') or 'shell'}",
+                        f"running · {ago(self.started)} ")
 
     def pump(self):
         try:
@@ -255,14 +431,19 @@ class ShellView:
         if not data:
             return False
         self.pos += len(data)
-        sys.stdout.write(data.decode("utf-8", "replace"))
-        sys.stdout.flush()
+        text = self.part + ANSI.sub("", data.decode("utf-8", "replace"))
+        *lines, self.part = text.split("\n")
+        for l in lines:
+            self.emit([("", l.rsplit("\r", 1)[-1])])
         return True
 
     def finished(self):
         now = time.time()
         if self.pids:
             self.pids = {p for p in self.pids if alive(p)}
+            if not self.pids and self.part:
+                self.emit([("", self.part)])
+                self.part = ""
             return not self.pids
         if now - self.looked >= 1.0:  # find the writer; it may not have opened the file yet
             self.looked = now
@@ -272,7 +453,55 @@ class ShellView:
         return now - self.started > 5
 
 
-# --- grind loops ---------------------------------------------------------------
+class RosterTile(Tile):
+    """The family tree of a session's agents and shells, redrawn from roster.json."""
+
+    def __init__(self, spec):
+        super().__init__()
+        self.path, self.pid = spec["roster"], spec.get("pid")
+        self.mtime, self.rows, self.drawn_min = 0, [], -1
+        title("◉ roster")
+
+    def header(self, cols):
+        n = sum(1 for r in self.rows if r.get("state") == "run" and r.get("shape") != "$")
+        return self.bar(cols, "#3E4451", " ◉ roster", f"{n} agent{'s' * (n != 1)} running ")
+
+    def pump(self):
+        try:
+            m = os.path.getmtime(self.path)
+        except OSError:
+            return False
+        minute = int(time.time() // 60)
+        if m == self.mtime and minute == self.drawn_min:
+            return False
+        self.mtime, self.drawn_min = m, minute
+        try:
+            with open(self.path) as f:
+                self.rows = json.load(f).get("rows") or []
+        except (OSError, ValueError):
+            return False
+        self.lines, self._wrap = [], (None, 0, [])
+        cols = width()
+        for r in self.rows:
+            indent = "  " * (r.get("depth", 1) - 1)
+            done = r.get("state") != "run"
+            mark = "✓ " if done else ("" if r.get("tile") else "◌ ")
+            idx = f"{r.get('shape')} {r.get('code') if r.get('shape') != '$' else ''}".rstrip()
+            text = f" {r.get('description') or ''}{' ⑂' if r.get('fork') else ''}"
+            info = f" · {ago(r.get('started'))}" + (f" · {r['action']}" if r.get("action") and not done else "")
+            line = [("", indent), (DIM, mark), (DIM if done else fg(r.get("color")) + BOLD, idx), (DIM if done else "", text)]
+            line.append((DIM, cut(info, max(0, cols - len(indent) - len(mark) - len(idx) - len(text)))))
+            self.lines.append(line)
+        if not self.rows:
+            self.lines.append([(DIM, " no agents yet")])
+        self.dirty = True
+        return True
+
+    def finished(self):
+        return False  # the watcher closes the roster
+
+
+# --- grind loops (streamed into their own tab) -------------------------------------
 
 SESSIONS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "sessions")
 PROJECTS_T = os.path.join(os.path.dirname(SESSIONS), "projects")
@@ -285,14 +514,16 @@ class LoopView:
     def __init__(self, spec):
         self.group, self.unit, self.state = spec["group"], spec.get("unit"), spec.get("state")
         title(self.group)
+        sys.stdout.write("\033[H\033[2J")
         out(f"{BOLD}{self.group}{RESET}  {DIM}{self.unit or 'headless sessions'}{RESET}")
         out(f"{DIM}{'─' * min(width(), 80)}{RESET}")
         self.pattern = re.compile(re.escape(self.group) + r"-\d+")
-        self.cur = None            # {pid, name, path, pos, buf}
+        self.cur = None            # (pid, name, Follow)
         self.idle_since = time.time()
         self.looked = 0.0
         self.unit_at, self.unit_on = 0.0, bool(self.unit)
         self.waiting_said = False
+        self.dirty = False
 
     def live(self):
         best = None
@@ -312,46 +543,20 @@ class LoopView:
         hits = [h for h in hits if os.path.exists(h)]
         if not hits:
             return False  # no transcript yet
-        path = max(hits, key=os.path.getmtime)
         started = time.strftime("%H:%M", time.localtime((d.get("startedAt") or 0) / 1000))
         out(f"\n{CYAN}── {d.get('name')} · started {started}{RESET}")
-        with open(path, "rb") as f:
-            data = f.read()
-        lines = data.split(b"\n")
-        if len(lines) > CATCH_UP + 1:
-            out(f"{DIM}  … {len(lines) - CATCH_UP - 1} earlier entries{RESET}")
-            lines = lines[-(CATCH_UP + 1):]
-        *done, buf = lines
-        for line in done:
-            try:
-                render(json.loads(line))
-            except (ValueError, AttributeError, TypeError):
-                pass
-        self.cur = {"pid": d.get("pid"), "name": d.get("name"), "path": path, "pos": len(data), "buf": buf}
+        self.cur = (d.get("pid"), d.get("name"), Follow(max(hits, key=os.path.getmtime), emit_stream, CATCH_UP))
         self.waiting_said = False
         return True
 
     def pump(self):
         now, got = time.time(), False
         if self.cur:
-            try:
-                with open(self.cur["path"], "rb") as f:
-                    f.seek(self.cur["pos"])
-                    data = f.read()
-            except OSError:
-                data = b""
-            if data:
+            pid, name, follow = self.cur
+            if follow.pump():
                 got = True
-                self.cur["pos"] += len(data)
-                self.cur["buf"] += data
-                *lines, self.cur["buf"] = self.cur["buf"].split(b"\n")
-                for line in lines:
-                    try:
-                        render(json.loads(line))
-                    except (ValueError, AttributeError, TypeError):
-                        pass
-            elif not alive(self.cur["pid"]):
-                out(f"{DIM}── {self.cur['name']} ended{RESET}")
+            elif not alive(pid):
+                out(f"{DIM}── {name} ended{RESET}")
                 self.cur, self.idle_since = None, now
         if not self.cur and now - self.looked >= 2:
             self.looked = now
@@ -374,12 +579,23 @@ class LoopView:
         idle = now - self.idle_since
         return idle > 600 if not self.unit else (not self.unit_on and idle > 30)
 
+    def closing(self, left):
+        if not getattr(self, "said_closing", False):
+            out(f"\n{GREEN}── loop stopped{RESET}{DIM} · closes in {left} s · q close now · k keep{RESET}")
+            self.said_closing = True
 
-# --- main loop -----------------------------------------------------------------
+    def scroll(self, k):
+        pass
+
+    def draw(self):
+        pass
+
+
+# --- main loop -------------------------------------------------------------------
 
 def key(timeout):
     r, _, _ = select.select([sys.stdin], [], [], timeout)
-    return os.read(sys.stdin.fileno(), 16).decode(errors="ignore") if r else ""
+    return os.read(sys.stdin.fileno(), 64).decode(errors="ignore") if r else ""
 
 
 def close_pane(whole_tab=False):
@@ -408,34 +624,54 @@ def main():
     except (OSError, ValueError) as e:
         print(f"claude-herdr-view: {e}")
         return 1
-    sys.stdout.write("\033[H\033[2J")
-    view = {"agent": AgentView, "loop": LoopView}.get(spec.get("mode"), ShellView)(spec)
-    natural = False
+    mode = spec.get("mode")
+    tiled = mode in ("agent", "shell", "roster")
+    if tiled:
+        sys.stdout.write("\033[?1049h\033[?25l")  # own screen, no cursor
+    view = {"agent": AgentTile, "shell": ShellTile, "roster": RosterTile, "loop": LoopView}.get(mode, ShellTile)(spec)
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
 
     tty_ok = sys.stdin.isatty()
     saved = termios.tcgetattr(sys.stdin) if tty_ok else None
     if tty_ok:
         tty.setcbreak(sys.stdin.fileno())
+    natural = False
+    last_draw = 0.0
+
+    def step():
+        nonlocal last_draw
+        view.pump()
+        k = key(TICK) if tty_ok else (time.sleep(TICK) or "")
+        view.scroll(k)
+        now = time.time()
+        if tiled and (resized[0] or (view.dirty and now - last_draw > 0.2) or now - last_draw > 15):
+            resized[0] = False
+            view.dirty = True
+            view.draw()
+            last_draw = now
+        return k
+
     try:
         while True:
-            view.pump()
-            k = key(TICK) if tty_ok else (time.sleep(TICK) or "")
-            if "q" in k:
+            if "q" in step():
                 return 0
             if not view.finished():
                 continue
             view.pump()
-            out(f"\n{GREEN}── finished{RESET}{DIM} · closes in {LINGER} s · q close now · k keep{RESET}")
-            end, keep = time.time() + LINGER, False
-            while keep or time.time() < end:
-                k = key(TICK) if tty_ok else (time.sleep(TICK) or "")
+            end = time.time() + LINGER
+            view.keep = False
+            while view.keep or time.time() < end:
+                view.closing(int(end - time.time()))
+                k = step()
                 if "q" in k:
                     return 0
-                if "k" in k and not keep:
-                    keep = True
-                    out(f"{YELLOW}kept open · q closes{RESET}")
+                if "k" in k and not view.keep:
+                    view.keep = True
+                    view.dirty = True
                 if view.pump() and not view.finished():
-                    out(f"{YELLOW}── working again{RESET}")
+                    view.done_at = None  # working again
+                    view.dirty = True
                     break
             else:
                 natural = True
@@ -443,12 +679,15 @@ def main():
     finally:
         if tty_ok:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
-        if spec.get("mode") == "loop" and natural and spec.get("state"):
+        if tiled:
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
+        if mode == "loop" and natural and spec.get("state"):
             try:  # the loop stopped: a new run of it may get a tab again
                 os.unlink(spec["state"])
             except OSError:
                 pass
-        close_pane(whole_tab=spec.get("mode") == "loop")
+        close_pane(whole_tab=mode == "loop")
 
 
 if __name__ == "__main__":
